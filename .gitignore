@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+
+# 虚拟环境
+venv/
+
+# 模型权重
+checkpoints_double/
+
+# 数据缓存
+stock_data_cache/
+
+# 测试/回测输出
+test_results_encoder_v4/
+
+# 数据库
+portfolio.db
+
+# 日志
+logs/
+
+# 前端构建产物
+frontend/node_modules/
+frontend/dist/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
