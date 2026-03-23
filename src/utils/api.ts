@@ -6,6 +6,9 @@ import type {
   TradesData,
   SignalsData,
   Slot,
+  ExecutionsData,
+  ExecutionsSummary,
+  PendingOrdersData,
 } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8080";
@@ -43,4 +46,24 @@ export const api = {
     request<SignalsData>("/api/signals", date ? { date } : {}),
   signalDates: () => request<string[]>("/api/signals/dates"),
   slots: () => request<Slot[]>("/api/slots"),
+  executions: (params: {
+    page?: number;
+    size?: number;
+    action?: string;
+    stock_code?: string;
+    start_date?: string;
+    end_date?: string;
+  } = {}) => {
+    const q: Record<string, string> = {};
+    if (params.page) q.page = String(params.page);
+    if (params.size) q.size = String(params.size);
+    if (params.action) q.action = params.action;
+    if (params.stock_code) q.stock_code = params.stock_code;
+    if (params.start_date) q.start_date = params.start_date;
+    if (params.end_date) q.end_date = params.end_date;
+    return request<ExecutionsData>("/api/executions", q);
+  },
+  executionsSummary: () => request<ExecutionsSummary>("/api/executions/summary"),
+  pendingOrders: (status?: string) =>
+    request<PendingOrdersData>("/api/pending-orders", status ? { status } : {}),
 };

@@ -6,6 +6,8 @@ import {
   StockOutlined,
   SwapOutlined,
   ThunderboltOutlined,
+  FileTextOutlined,
+  OrderedListOutlined,
 } from "@ant-design/icons";
 import { extractTokenFromUrl, clearToken } from "./utils/auth";
 import ErrorBoundary from "./components/ErrorBoundary";
@@ -14,14 +16,18 @@ import Dashboard from "./pages/Dashboard";
 import Holdings from "./pages/Holdings";
 import Trades from "./pages/Trades";
 import Signals from "./pages/Signals";
+import Executions from "./pages/Executions";
+import PendingOrders from "./pages/PendingOrders";
 
 const { Header, Content, Sider } = Layout;
 
 const menuItems = [
   { key: "/", icon: <DashboardOutlined />, label: <NavLink to="/">Dashboard</NavLink> },
   { key: "/holdings", icon: <StockOutlined />, label: <NavLink to="/holdings">持仓</NavLink> },
-  { key: "/trades", icon: <SwapOutlined />, label: <NavLink to="/trades">交易记录</NavLink> },
+  { key: "/executions", icon: <FileTextOutlined />, label: <NavLink to="/executions">交割单</NavLink> },
+  { key: "/pending-orders", icon: <OrderedListOutlined />, label: <NavLink to="/pending-orders">挂单</NavLink> },
   { key: "/signals", icon: <ThunderboltOutlined />, label: <NavLink to="/signals">每日信号</NavLink> },
+  { key: "/trades", icon: <SwapOutlined />, label: <NavLink to="/trades">已完成交易对</NavLink> },
 ];
 
 function NoToken() {
@@ -89,6 +95,8 @@ function AppContent() {
             <Route path="/holdings" element={<Holdings />} />
             <Route path="/trades" element={<Trades />} />
             <Route path="/signals" element={<Signals />} />
+            <Route path="/executions" element={<Executions />} />
+            <Route path="/pending-orders" element={<PendingOrders />} />
             <Route path="/404" element={<NotFound />} />
             <Route path="*" element={<Navigate to="/404" replace />} />
           </Routes>
