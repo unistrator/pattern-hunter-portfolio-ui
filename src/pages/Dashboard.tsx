@@ -26,7 +26,7 @@ export default function Dashboard() {
   const [valueDate, setValueDate] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [selectedIndex, setSelectedIndex] = useState<string>("000300.SH");
+  const [selectedIndex, setSelectedIndex] = useState<string>("000905.SH");
   const [indexData, setIndexData] = useState<IndexDailyPoint[]>([]);
   const [indexLoading, setIndexLoading] = useState(false);
   const isMobile = useIsMobile();
