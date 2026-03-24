@@ -9,6 +9,7 @@ import {
   FileTextOutlined,
   OrderedListOutlined,
 } from "@ant-design/icons";
+import { Analytics } from "@vercel/analytics/react";
 import { extractTokenFromUrl, clearToken } from "./utils/auth";
 import ErrorBoundary from "./components/ErrorBoundary";
 import useIsMobile from "./hooks/useIsMobile";
@@ -193,6 +194,7 @@ export default function App() {
       <ConfigProvider theme={{ algorithm: theme.darkAlgorithm }}>
         <AppContent />
       </ConfigProvider>
+      <Analytics />
     </ErrorBoundary>
   );
 }
