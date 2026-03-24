@@ -44,6 +44,8 @@ export default function Holdings() {
   const [slots, setSlots] = useState<Slot[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [pageSize, setPageSize] = useState(50);
+  const [currentPage, setCurrentPage] = useState(1);
   const isMobile = useIsMobile();
 
   useEffect(() => {
@@ -191,7 +193,17 @@ export default function Holdings() {
               columns={positionColumns}
               rowKey="id"
               size="small"
-              pagination={{ pageSize: 50 }}
+              pagination={{
+                current: currentPage,
+                pageSize,
+                showSizeChanger: true,
+                pageSizeOptions: ["20", "50", "100"],
+                onChange: (page, size) => {
+                  setCurrentPage(size !== pageSize ? 1 : page);
+                  setPageSize(size);
+                },
+                showTotal: (total) => `共 ${total} 条`,
+              }}
               scroll={{ x: 1100 }}
             />
           </Card>
