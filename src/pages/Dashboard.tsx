@@ -118,6 +118,24 @@ export default function Dashboard() {
     };
   }, [navData, indexData]);
 
+  const lastDayStats = useMemo(() => {
+    if (navData.length < 2) return null;
+
+    const last = navData[navData.length - 1];
+    const prev = navData[navData.length - 2];
+    const portfolioReturn = ((last.total_value / prev.total_value) - 1) * 100;
+    const lastDateYMD = last.date.replace(/-/g, "");
+
+    const indexPoint = indexData.find(d => d.trade_date === lastDateYMD);
+    const indexReturn = indexPoint?.pct_chg ?? null;
+
+    return {
+      date: last.date,
+      portfolioReturn: Number(portfolioReturn.toFixed(2)),
+      indexReturn: indexReturn !== null ? Number(indexReturn.toFixed(2)) : null,
+    };
+  }, [navData, indexData]);
+
   if (loading) return <Spin size="large" style={{ display: "block", margin: "100px auto" }} />;
   if (error) return <Alert type="error" message={error} />;
   if (!overview) return null;
@@ -299,6 +317,40 @@ export default function Dashboard() {
             )}
           </Card>
         </Col>
+        {lastDayStats && (
+          <>
+            <Col xs={12} sm={6}>
+              <Card size={isMobile ? "small" : "default"}>
+                <Statistic
+                  title="当日组合收益"
+                  value={lastDayStats.portfolioReturn}
+                  precision={2}
+                  suffix="%"
+                  valueStyle={{ color: lastDayStats.portfolioReturn >= 0 ? "#3f8600" : "#cf1322" }}
+                  prefix={lastDayStats.portfolioReturn >= 0 ? <ArrowUpOutlined /> : <ArrowDownOutlined />}
+                />
+                <div style={{ marginTop: 4, fontSize: 12, color: "rgba(255,255,255,0.45)" }}>
+                  {lastDayStats.date}
+                </div>
+              </Card>
+            </Col>
+            <Col xs={12} sm={6}>
+              <Card size={isMobile ? "small" : "default"}>
+                <Statistic
+                  title="当日中证500"
+                  value={lastDayStats.indexReturn ?? 0}
+                  precision={2}
+                  suffix="%"
+                  valueStyle={{ color: (lastDayStats.indexReturn ?? 0) >= 0 ? "#3f8600" : "#cf1322" }}
+                  prefix={(lastDayStats.indexReturn ?? 0) >= 0 ? <ArrowUpOutlined /> : <ArrowDownOutlined />}
+                />
+                <div style={{ marginTop: 4, fontSize: 12, color: "rgba(255,255,255,0.45)" }}>
+                  {lastDayStats.date}
+                </div>
+              </Card>
+            </Col>
+          </>
+        )}
       </Row>
 
       <Card title="净值走势" size={isMobile ? "small" : "default"} style={{ marginTop: 12 }}>
