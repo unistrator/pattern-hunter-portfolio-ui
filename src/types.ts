@@ -29,6 +29,7 @@ export interface NavPoint {
   total_value: number;
   drawdown: number;
   return_pct: number;
+  day_return?: number;
 }
 
 export interface Position {
@@ -160,4 +161,26 @@ export interface IndexDailyResponse {
   data: IndexDailyPoint[];
   total: number;
   ts_code: string;
+}
+
+export interface HoldingsDailyItem {
+  stock_code: string;
+  shares: number;
+  slot_idx: number[];
+  open: number | null;
+  high: number | null;
+  low: number | null;
+  close: number | null;
+  pre_close: number | null;
+  change: number | null;
+  pct_chg: number | null;
+  vol: number;
+  amount: number;
+  is_realtime?: boolean;
+}
+
+export interface HoldingsDailyResponse {
+  date: string;
+  items: HoldingsDailyItem[];
+  total: number;
 }

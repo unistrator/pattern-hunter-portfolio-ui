@@ -8,6 +8,7 @@ import {
   ThunderboltOutlined,
   FileTextOutlined,
   OrderedListOutlined,
+  PieChartOutlined,
 } from "@ant-design/icons";
 import { Analytics } from "@vercel/analytics/react";
 import { extractTokenFromUrl, clearToken } from "./utils/auth";
@@ -20,6 +21,7 @@ import Trades from "./pages/Trades";
 import Signals from "./pages/Signals";
 import Executions from "./pages/Executions";
 import PendingOrders from "./pages/PendingOrders";
+import Contributions from "./pages/Contributions";
 
 const { Header, Content, Sider } = Layout;
 
@@ -30,6 +32,7 @@ const menuItems = [
   { key: "/pending-orders", icon: <OrderedListOutlined />, label: <NavLink to="/pending-orders">挂单</NavLink> },
   { key: "/signals", icon: <ThunderboltOutlined />, label: <NavLink to="/signals">每日信号</NavLink> },
   { key: "/trades", icon: <SwapOutlined />, label: <NavLink to="/trades">已完成交易对</NavLink> },
+  { key: "/contributions", icon: <PieChartOutlined />, label: <NavLink to="/contributions">贡献度</NavLink> },
 ];
 
 const mobileNavItems = [
@@ -39,6 +42,7 @@ const mobileNavItems = [
   { key: "/pending-orders", icon: <OrderedListOutlined />, label: "挂单", to: "/pending-orders" },
   { key: "/signals", icon: <ThunderboltOutlined />, label: "信号", to: "/signals" },
   { key: "/trades", icon: <SwapOutlined />, label: "交易", to: "/trades" },
+  { key: "/contributions", icon: <PieChartOutlined />, label: "贡献度", to: "/contributions" },
 ];
 
 function NoToken() {
@@ -123,6 +127,7 @@ function AppContent() {
     <Routes>
       <Route path="/" element={<Dashboard />} />
       <Route path="/holdings" element={<Holdings />} />
+      <Route path="/contributions" element={<Contributions />} />
       <Route path="/trades" element={<Trades />} />
       <Route path="/signals" element={<Signals />} />
       <Route path="/executions" element={<Executions />} />
