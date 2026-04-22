@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   Card,
   Spin,
@@ -102,6 +102,64 @@ function pnlColor(v: number | null | undefined) {
   return "rgba(255,255,255,0.65)";
 }
 
+// 贡献度排行图统一使用的「纯左右滚动」滑块（窗口固定，禁止缩放）
+function buildScrollDataZoom(endPercent: number) {
+  return [
+    {
+      type: "slider" as const,
+      show: true,
+      xAxisIndex: 0,
+      start: 0,
+      end: endPercent,
+      height: 10,
+      bottom: 4,
+      brushSelect: false,
+      zoomLock: true,
+      showDetail: false,
+      showDataShadow: false,
+      handleSize: 0,
+      moveHandleSize: 0,
+      fillerColor: "rgba(255,255,255,0.25)",
+      borderColor: "transparent",
+      backgroundColor: "rgba(255,255,255,0.06)",
+    },
+    {
+      type: "inside" as const,
+      xAxisIndex: 0,
+      start: 0,
+      end: endPercent,
+      zoomLock: true,
+    },
+  ];
+}
+
+// 计算贡献度柱图 Y 轴范围（含 10% padding，零基线锚定）
+function computeAxisRange(values: number[]) {
+  const rawMin = Math.min(0, ...values);
+  const rawMax = Math.max(0, ...values);
+  const span = rawMax - rawMin || 1;
+  const pad = span * 0.1;
+  const yMin = rawMin < 0 ? Number((rawMin - pad).toFixed(4)) : 0;
+  const yMax = rawMax > 0 ? Number((rawMax + pad).toFixed(4)) : 0;
+  return { yMin, yMax };
+}
+
+// 已清股票表格单元格的 Tooltip 包装（仅在 proxy=true 时套 Tooltip）
+function ClosedProxyCell({
+  proxy,
+  title,
+  children,
+}: {
+  proxy: boolean;
+  title: string;
+  children: ReactNode;
+}) {
+  if (!proxy) return <>{children}</>;
+  return <Tooltip title={title}>{children}</Tooltip>;
+}
+
+const CLOSED_PROXY_TIP = "已清仓，按卖出成交均价相对昨收推算";
+
 async function fetchExecutionsForDate(date: string): Promise<Execution[]> {
   const SIZE_CANDIDATES = [100, 50, 20];
   const baseQuery = { start_date: date, end_date: date };
@@ -139,7 +197,6 @@ export default function Contributions() {
 
   const [selectedDate, setSelectedDate] = useState<string>("");
   const [chartMode, setChartMode] = useState<"stock" | "slot">("stock");
-  const [tableRank, setTableRank] = useState<"gain" | "loss">("gain");
 
   const [items, setItems] = useState<HoldingsDailyItem[]>([]);
   const [executions, setExecutions] = useState<Execution[]>([]);
@@ -259,6 +316,19 @@ export default function Contributions() {
     return map;
   }, [executions]);
 
+  const execsByCode = useMemo(() => {
+    const map = new Map<string, Execution[]>();
+    for (const e of executions) {
+      const arr = map.get(e.stock_code);
+      if (arr) arr.push(e);
+      else map.set(e.stock_code, [e]);
+    }
+    for (const arr of map.values()) {
+      arr.sort((a, b) => a.id - b.id);
+    }
+    return map;
+  }, [executions]);
+
   // 当日完全卖出（开盘前持有但收盘已不在持仓）的股票：在 executions 里有 sell，
   // 但不在 holdings/daily 的 items 里。它们仍然贡献当日 P&L。
   const closedTodayCodes = useMemo(() => {
@@ -358,15 +428,27 @@ export default function Contributions() {
         sellPnl = exec.sell_amount - preClose * exec.sell_shares;
         totalPnl = buyPnl + sellPnl;
       }
+      // 已清股票拿不到当日官方收盘，用「卖出成交均价」作为 close 代理：
+      //   close ≈ sell_amount / sell_shares（vwap of sells）
+      // change / pct_chg 据此对昨收推算，反映用户「实际卖出价相对昨收的偏离」。
+      const avgSellPrice =
+        exec.sell_shares > 0 ? exec.sell_amount / exec.sell_shares : null;
+      const closeProxy = avgSellPrice;
+      const change =
+        closeProxy != null && preClose != null ? closeProxy - preClose : null;
+      const pctChg =
+        change != null && preClose != null && preClose > 0
+          ? (change / preClose) * 100
+          : null;
       return {
         stock_code: code,
         slot_idx: [],
         shares: 0,
         shares_prev: sharesPrev,
-        close: null,
+        close: closeProxy,
         pre_close: preClose,
-        change: null,
-        pct_chg: null,
+        change,
+        pct_chg: pctChg,
         is_suspended: false,
         is_realtime: false,
         hold_pnl: 0,
@@ -506,7 +588,7 @@ export default function Contributions() {
       isLoss = false
     ) => {
       if (!subset.length) return null;
-      const initialWindow = isMobile ? 15 : 30;
+      const initialWindow = 30;
       const sorted = [...subset].sort(
         (a, b) => Math.abs(b.contribution_pct) - Math.abs(a.contribution_pct)
       );
@@ -519,13 +601,7 @@ export default function Contributions() {
       const endPercent = needZoom
         ? Math.min(100, (initialWindow / sorted.length) * 100)
         : 100;
-      const values = data.map((d) => d.value);
-      const rawMin = Math.min(0, ...values);
-      const rawMax = Math.max(0, ...values);
-      const span = rawMax - rawMin || 1;
-      const pad = span * 0.1;
-      const yMin = rawMin < 0 ? Number((rawMin - pad).toFixed(4)) : 0;
-      const yMax = rawMax > 0 ? Number((rawMax + pad).toFixed(4)) : 0;
+      const { yMin, yMax } = computeAxisRange(data.map((d) => d.value));
       return {
         tooltip: {
           trigger: "axis" as const,
@@ -551,7 +627,7 @@ export default function Contributions() {
               `<b>${r.stock_code}</b>${
                 r.slot_idx.length ? ` · #${r.slot_idx.join(",")}` : ""
               }`,
-              `贡献度: <b>${fmtPct(r.contribution_pct)}</b>${
+              `贡献度: <b>${fmtPct(r.contribution_pct, 4)}</b>${
                 Math.abs(r.contribution_share) > 0
                   ? `（占当日盈亏 ${fmtPct(r.contribution_share)}）`
                   : ""
@@ -562,15 +638,42 @@ export default function Contributions() {
                 : `涨跌幅: ${fmtPct(r.pct_chg)}`,
               closeLine,
               preCloseLine,
-              `持股: ${r.shares.toFixed(0)}（开盘前 ${r.shares_prev.toFixed(
-                0
-              )}）`,
+              `持股: ${r.shares.toFixed(0)}`,
             ];
             if (r.exec.buy_count + r.exec.sell_count > 0) {
+              const stockExecs = execsByCode.get(r.stock_code) ?? [];
               lines.push(
-                `成交: 买 ${r.exec.buy_count} / 卖 ${
-                  r.exec.sell_count
-                }，成本 ${fmtMoney(r.exec.total_exec_cost, 2)}`
+                `<div style="margin-top:4px;border-top:1px solid rgba(255,255,255,0.15);padding-top:4px">成交明细 · 买 <span style="color:${POS_COLOR}">${r.exec.buy_count}</span> / 卖 <span style="color:${NEG_COLOR}">${r.exec.sell_count}</span></div>`
+              );
+              const MAX_ROWS = 6;
+              const shown = stockExecs.slice(0, MAX_ROWS);
+              for (const e of shown) {
+                const isBuy = e.action === "buy";
+                const actionLabel = isBuy
+                  ? `<span style="color:${POS_COLOR};font-weight:600">买入</span>`
+                  : `<span style="color:${NEG_COLOR};font-weight:600">卖出</span>`;
+                const amountLabel = isBuy ? "买入额" : "卖出额";
+                lines.push(
+                  `${actionLabel} ${e.shares.toFixed(
+                    0
+                  )} 股，${amountLabel}：<b>${fmtMoney(e.amount, 2)}</b>`
+                );
+              }
+              if (stockExecs.length > MAX_ROWS) {
+                lines.push(
+                  `<span style="color:rgba(255,255,255,0.45)">…另 ${
+                    stockExecs.length - MAX_ROWS
+                  } 笔</span>`
+                );
+              }
+              lines.push(
+                `<span style="color:rgba(255,255,255,0.55)">买入额 ${fmtMoney(
+                  r.exec.buy_amount,
+                  0
+                )} · 卖出额 ${fmtMoney(
+                  r.exec.sell_amount,
+                  0
+                )} · 成本 ${fmtMoney(r.exec.total_exec_cost, 2)}</span>`
               );
             }
             return lines.join("<br/>");
@@ -581,36 +684,17 @@ export default function Contributions() {
               left: 56,
               right: 16,
               top: 36,
-              bottom: needZoom ? 86 : 60,
+              bottom: needZoom ? 30 : 8,
               containLabel: true,
             }
           : {
               left: 64,
               right: 30,
               top: 40,
-              bottom: needZoom ? 96 : 70,
+              bottom: needZoom ? 32 : 10,
               containLabel: true,
             },
-        dataZoom: needZoom
-          ? [
-              {
-                type: "slider" as const,
-                show: true,
-                xAxisIndex: 0,
-                start: 0,
-                end: endPercent,
-                height: 18,
-                bottom: 8,
-                brushSelect: false,
-              },
-              {
-                type: "inside" as const,
-                xAxisIndex: 0,
-                start: 0,
-                end: endPercent,
-              },
-            ]
-          : undefined,
+        dataZoom: needZoom ? buildScrollDataZoom(endPercent) : undefined,
         xAxis: {
           type: "category" as const,
           data: codes,
@@ -660,18 +744,12 @@ export default function Contributions() {
         value: Number(s.contribution_pct.toFixed(4)),
         itemStyle: { color },
       }));
-      const initialSlotWindow = isMobile ? 15 : 30;
+      const initialSlotWindow = 30;
       const needZoom = sorted.length > initialSlotWindow;
       const endPercent = needZoom
         ? Math.min(100, (initialSlotWindow / sorted.length) * 100)
         : 100;
-      const values = data.map((d) => d.value);
-      const rawMin = Math.min(0, ...values);
-      const rawMax = Math.max(0, ...values);
-      const span = rawMax - rawMin || 1;
-      const pad = span * 0.1;
-      const yMin = rawMin < 0 ? Number((rawMin - pad).toFixed(4)) : 0;
-      const yMax = rawMax > 0 ? Number((rawMax + pad).toFixed(4)) : 0;
+      const { yMin, yMax } = computeAxisRange(data.map((d) => d.value));
       return {
         tooltip: {
           trigger: "axis" as const,
@@ -686,7 +764,7 @@ export default function Contributions() {
               s.slot < 0 ? `<b>未分配 / 已清</b>` : `<b>槽位 #${s.slot}</b>`;
             const lines = [
               head,
-              `贡献度: <b>${fmtPct(s.contribution_pct)}</b>`,
+              `贡献度: <b>${fmtPct(s.contribution_pct, 4)}</b>`,
               `贡献金额: ${fmtMoney(s.total_pnl, 2)}`,
               `成员: ${s.stock_count} 只`,
             ];
@@ -708,9 +786,14 @@ export default function Contributions() {
                         m.slot_count > 1
                           ? ` <span style="color:rgba(255,255,255,0.45)">(1/${m.slot_count})</span>`
                           : "";
+                      const ag = execAggByCode.get(m.code);
+                      const tradeStr =
+                        ag && ag.buy_count + ag.sell_count > 0
+                          ? ` <span style="color:rgba(255,255,255,0.45)">[买${ag.buy_count}/卖${ag.sell_count}]</span>`
+                          : "";
                       return `${m.code}${split}: <span style="color:${c}">${fmtPct(
                         m.partial_pct
-                      )}</span>`;
+                      )}</span>${tradeStr}`;
                     })
                     .join("<br/>")
               );
@@ -730,36 +813,17 @@ export default function Contributions() {
               left: 56,
               right: 16,
               top: 36,
-              bottom: needZoom ? 76 : 50,
+              bottom: needZoom ? 26 : 8,
               containLabel: true,
             }
           : {
               left: 64,
               right: 30,
               top: 40,
-              bottom: needZoom ? 76 : 50,
+              bottom: needZoom ? 28 : 10,
               containLabel: true,
             },
-        dataZoom: needZoom
-          ? [
-              {
-                type: "slider" as const,
-                show: true,
-                xAxisIndex: 0,
-                start: 0,
-                end: endPercent,
-                height: 18,
-                bottom: 8,
-                brushSelect: false,
-              },
-              {
-                type: "inside" as const,
-                xAxisIndex: 0,
-                start: 0,
-                end: endPercent,
-              },
-            ]
-          : undefined,
+        dataZoom: needZoom ? buildScrollDataZoom(endPercent) : undefined,
         xAxis: {
           type: "category" as const,
           data: labels,
@@ -810,7 +874,7 @@ export default function Contributions() {
       gain: buildStockOption(positives, POS_COLOR),
       loss: buildStockOption(negatives, NEG_COLOR, true),
     };
-  }, [rows, slotRows, chartMode, isMobile]);
+  }, [rows, slotRows, chartMode, isMobile, execsByCode, execAggByCode]);
 
   const dateOptions = useMemo(
     () =>
@@ -841,19 +905,6 @@ export default function Contributions() {
       render: (v: string, r: ContribRow) => (
         <span>
           {v}
-          {r.shares === 0 && (
-            <Tooltip
-              title={
-                r.pre_close == null
-                  ? "完全卖出，但前一交易日无昨收数据，贡献度计为 0"
-                  : `完全卖出，按前一交易日收盘价 ${r.pre_close.toFixed(2)} 作为成本基准做精确归因`
-              }
-            >
-              <Tag color={r.pre_close == null ? "default" : "orange"} style={{ marginLeft: 4 }}>
-                {r.pre_close == null ? "已清·无昨收" : "已清"}
-              </Tag>
-            </Tooltip>
-          )}
           {r.is_suspended && (
             <Tooltip title="停牌，无行情">
               <Tag color="default" style={{ marginLeft: 4 }}>停牌</Tag>
@@ -870,30 +921,54 @@ export default function Contributions() {
       render: renderSlots,
     },
     {
-      title: () => (
-        <span>
-          贡献度{" "}
-          <Tooltip title="该股票 P&L ÷ 前一交易日组合总资产 × 100%。所有股票贡献度合计 ≈ 组合涨跌幅。">
-            <InfoCircleOutlined style={{ color: "rgba(255,255,255,0.45)" }} />
-          </Tooltip>
-        </span>
-      ),
+      title: "方向",
+      key: "trade_action",
+      width: 120,
+      render: (_: unknown, r: ContribRow) => {
+        const buy = r.exec.buy_count > 0;
+        const sell = r.exec.sell_count > 0;
+        if (!buy && !sell) {
+          return <span style={{ color: "rgba(255,255,255,0.45)" }}>—</span>;
+        }
+        return (
+          <span>
+            {buy && (
+              <Tooltip
+                title={`买入 ${r.exec.buy_count} 笔，共 ${r.exec.buy_shares.toFixed(
+                  0
+                )} 股 / ${fmtMoney(r.exec.buy_amount, 2)}`}
+              >
+                <Tag color="green" style={{ marginRight: 2 }}>
+                  买入{r.exec.buy_count > 1 ? `×${r.exec.buy_count}` : ""}
+                </Tag>
+              </Tooltip>
+            )}
+            {sell && (
+              <Tooltip
+                title={`卖出 ${r.exec.sell_count} 笔，共 ${r.exec.sell_shares.toFixed(
+                  0
+                )} 股 / ${fmtMoney(r.exec.sell_amount, 2)}`}
+              >
+                <Tag color="red" style={{ marginRight: 2 }}>
+                  卖出{r.exec.sell_count > 1 ? `×${r.exec.sell_count}` : ""}
+                </Tag>
+              </Tooltip>
+            )}
+          </span>
+        );
+      },
+    },
+    {
+      title: "贡献度",
       dataIndex: "contribution_pct",
       key: "contribution_pct",
-      width: 110,
+      width: 130,
       render: (v: number) => (
-        <span style={{ color: pnlColor(v), fontWeight: 600 }}>{fmtPct(v)}</span>
+        <span style={{ color: pnlColor(v), fontWeight: 600 }}>{fmtPct(v, 4)}</span>
       ),
     },
     {
-      title: () => (
-        <span>
-          贡献金额{" "}
-          <Tooltip title="持仓 P&L + 买入 P&L + 卖出 P&L（hover 单元格查看拆解）">
-            <InfoCircleOutlined style={{ color: "rgba(255,255,255,0.45)" }} />
-          </Tooltip>
-        </span>
-      ),
+      title: "贡献金额",
       dataIndex: "total_pnl",
       key: "total_pnl",
       width: 140,
@@ -975,31 +1050,49 @@ export default function Contributions() {
       dataIndex: "pct_chg",
       key: "pct_chg",
       width: 100,
-      render: (v: number | null) =>
-        v == null ? (
-          <span style={{ color: "rgba(255,255,255,0.45)" }}>—</span>
-        ) : (
-          <span style={{ color: pnlColor(v) }}>{fmtPct(v)}</span>
-        ),
+      render: (v: number | null, r: ContribRow) => {
+        if (v == null) return <span style={{ color: "rgba(255,255,255,0.45)" }}>—</span>;
+        return (
+          <ClosedProxyCell proxy={r.shares === 0} title={CLOSED_PROXY_TIP}>
+            <span style={{ color: pnlColor(v) }}>{fmtPct(v)}</span>
+          </ClosedProxyCell>
+        );
+      },
     },
     {
       title: "涨跌额",
       dataIndex: "change",
       key: "change",
       width: 100,
-      render: (v: number | null) =>
-        v == null ? "—" : (
-          <span style={{ color: pnlColor(v) }}>
-            {(v >= 0 ? "+" : "") + v.toFixed(2)}
-          </span>
-        ),
+      render: (v: number | null, r: ContribRow) => {
+        if (v == null) return "—";
+        return (
+          <ClosedProxyCell proxy={r.shares === 0} title={CLOSED_PROXY_TIP}>
+            <span style={{ color: pnlColor(v) }}>
+              {(v >= 0 ? "+" : "") + v.toFixed(2)}
+            </span>
+          </ClosedProxyCell>
+        );
+      },
     },
     {
       title: "收盘",
       dataIndex: "close",
       key: "close",
       width: 90,
-      render: (v: number | null) => (v == null ? "—" : v.toFixed(2)),
+      render: (v: number | null, r: ContribRow) => {
+        if (v == null) return "—";
+        return (
+          <ClosedProxyCell
+            proxy={r.shares === 0}
+            title={`已清仓，显示为卖出成交均价 = ¥${r.exec.sell_amount.toFixed(
+              2
+            )} ÷ ${r.exec.sell_shares.toFixed(0)} 股`}
+          >
+            <span>{v.toFixed(2)}</span>
+          </ClosedProxyCell>
+        );
+      },
     },
     {
       title: "昨收",
@@ -1036,25 +1129,48 @@ export default function Contributions() {
       dataIndex: "stock_code",
       key: "stock_code",
       fixed: "left" as const,
-      width: 100,
-      render: (v: string, r: ContribRow) => (
-        <div style={{ lineHeight: 1.3 }}>
-          <div style={{ fontWeight: 600 }}>{v}</div>
-          <div style={{ fontSize: 11, color: "rgba(255,255,255,0.45)" }}>
-            {r.slot_idx.length ? `#${r.slot_idx.join(",")}` : "—"}
-            {r.is_suspended && " · 停牌"}
-            {r.shares === 0 && (r.pre_close == null ? " · 已清·无昨收" : " · 已清")}
+      width: 110,
+      render: (v: string, r: ContribRow) => {
+        const buy = r.exec.buy_count > 0;
+        const sell = r.exec.sell_count > 0;
+        return (
+          <div style={{ lineHeight: 1.3 }}>
+            <div style={{ fontWeight: 600 }}>{v}</div>
+            <div style={{ fontSize: 11, color: "rgba(255,255,255,0.45)" }}>
+              {r.slot_idx.length ? `#${r.slot_idx.join(",")}` : "—"}
+              {r.is_suspended && " · 停牌"}
+            </div>
+            {(buy || sell) && (
+              <div style={{ marginTop: 2 }}>
+                {buy && (
+                  <Tag
+                    color="green"
+                    style={{ marginRight: 2, fontSize: 10, lineHeight: "16px", padding: "0 4px" }}
+                  >
+                    买{r.exec.buy_count > 1 ? r.exec.buy_count : ""}
+                  </Tag>
+                )}
+                {sell && (
+                  <Tag
+                    color="red"
+                    style={{ marginRight: 2, fontSize: 10, lineHeight: "16px", padding: "0 4px" }}
+                  >
+                    卖{r.exec.sell_count > 1 ? r.exec.sell_count : ""}
+                  </Tag>
+                )}
+              </div>
+            )}
           </div>
-        </div>
-      ),
+        );
+      },
     },
     {
       title: "贡献度",
       dataIndex: "contribution_pct",
       key: "contribution_pct",
-      width: 90,
+      width: 110,
       render: (v: number) => (
-        <span style={{ color: pnlColor(v), fontWeight: 600 }}>{fmtPct(v)}</span>
+        <span style={{ color: pnlColor(v), fontWeight: 600 }}>{fmtPct(v, 4)}</span>
       ),
     },
     {
@@ -1062,10 +1178,14 @@ export default function Contributions() {
       dataIndex: "pct_chg",
       key: "pct_chg",
       width: 80,
-      render: (v: number | null) =>
-        v == null ? <span style={{ color: "rgba(255,255,255,0.45)" }}>—</span> : (
-          <span style={{ color: pnlColor(v) }}>{fmtPct(v)}</span>
-        ),
+      render: (v: number | null, r: ContribRow) => {
+        if (v == null) return <span style={{ color: "rgba(255,255,255,0.45)" }}>—</span>;
+        return (
+          <ClosedProxyCell proxy={r.shares === 0} title={CLOSED_PROXY_TIP}>
+            <span style={{ color: pnlColor(v) }}>{fmtPct(v)}</span>
+          </ClosedProxyCell>
+        );
+      },
     },
     {
       title: "贡献金额",
@@ -1392,73 +1512,74 @@ export default function Contributions() {
                 <Empty />
               )}
             </Card>
-            <Card
-              size="small"
-              title={
-                <div
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                    flexWrap: "wrap",
-                    gap: 8,
-                  }}
-                >
-                  <span style={{ fontSize: isMobile ? 13 : 14 }}>
-                    个股贡献度明细
-                  </span>
-                  <Segmented
+            {(() => {
+              const gainRows = [...rows]
+                .filter((r) => r.contribution_pct > 0)
+                .sort((a, b) => b.contribution_pct - a.contribution_pct);
+              const lossRows = [...rows]
+                .filter((r) => r.contribution_pct < 0)
+                .sort((a, b) => a.contribution_pct - b.contribution_pct);
+              const tableProps = {
+                columns: isMobile ? mobileColumns : columns,
+                rowKey: "stock_code" as const,
+                size: "small" as const,
+                pagination: {
+                  defaultPageSize: 20,
+                  showSizeChanger: !isMobile,
+                  pageSizeOptions: ["20", "50", "100"],
+                  size: isMobile ? ("small" as const) : undefined,
+                  showTotal: (total: number) => `共 ${total} 只`,
+                },
+                scroll: { x: isMobile ? 440 : 1300 },
+              };
+              return (
+                <>
+                  <Card
                     size="small"
-                    value={tableRank}
-                    onChange={(v) => setTableRank(v as "gain" | "loss")}
-                    options={[
-                      {
-                        label: (
-                          <span>
-                            <RiseOutlined style={{ marginRight: 4 }} />
-                            涨
-                          </span>
-                        ),
-                        value: "gain",
-                      },
-                      {
-                        label: (
-                          <span>
-                            <FallOutlined style={{ marginRight: 4 }} />
-                            跌
-                          </span>
-                        ),
-                        value: "loss",
-                      },
-                    ]}
-                  />
-                </div>
-              }
-              styles={{ body: { padding: 0 } }}
-            >
-            <Table
-              dataSource={
-                tableRank === "gain"
-                  ? [...rows].sort(
-                      (a, b) => b.contribution_pct - a.contribution_pct
-                    )
-                  : [...rows].sort(
-                      (a, b) => a.contribution_pct - b.contribution_pct
-                    )
-              }
-              columns={isMobile ? mobileColumns : columns}
-              rowKey="stock_code"
-              size="small"
-              pagination={{
-                defaultPageSize: 20,
-                showSizeChanger: !isMobile,
-                pageSizeOptions: ["20", "50", "100"],
-                size: isMobile ? "small" : undefined,
-                showTotal: (total) => `共 ${total} 只`,
-              }}
-              scroll={{ x: isMobile ? 420 : 1180 }}
-            />
-            </Card>
+                    title={
+                      <span style={{ fontSize: isMobile ? 13 : 14 }}>
+                        <RiseOutlined
+                          style={{ color: POS_COLOR, marginRight: 6 }}
+                        />
+                        个股贡献度明细 · 涨
+                      </span>
+                    }
+                    styles={{ body: { padding: 0 } }}
+                    style={{ marginBottom: 12 }}
+                  >
+                    {gainRows.length ? (
+                      <Table dataSource={gainRows} {...tableProps} />
+                    ) : (
+                      <Empty
+                        description="无正贡献"
+                        style={{ padding: isMobile ? 30 : 60 }}
+                      />
+                    )}
+                  </Card>
+                  <Card
+                    size="small"
+                    title={
+                      <span style={{ fontSize: isMobile ? 13 : 14 }}>
+                        <FallOutlined
+                          style={{ color: NEG_COLOR, marginRight: 6 }}
+                        />
+                        个股贡献度明细 · 跌
+                      </span>
+                    }
+                    styles={{ body: { padding: 0 } }}
+                  >
+                    {lossRows.length ? (
+                      <Table dataSource={lossRows} {...tableProps} />
+                    ) : (
+                      <Empty
+                        description="无负贡献"
+                        style={{ padding: isMobile ? 30 : 60 }}
+                      />
+                    )}
+                  </Card>
+                </>
+              );
+            })()}
           </>
         )}
       </Card>
