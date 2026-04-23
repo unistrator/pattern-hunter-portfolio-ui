@@ -69,6 +69,9 @@ interface ContribRow {
   pct_chg: number | null;
   is_suspended: boolean;
   is_realtime: boolean;
+  // 当日开仓且当日清仓（昨日无持仓，sell_shares == buy_shares）。
+  // 这种 row 走"日内 PnL = sell_amount − buy_amount"分支，pre_close/close 是 vwap 代理。
+  is_intraday: boolean;
   // attribution
   hold_pnl: number;
   buy_pnl: number;
@@ -158,7 +161,13 @@ function ClosedProxyCell({
   return <Tooltip title={title}>{children}</Tooltip>;
 }
 
-const CLOSED_PROXY_TIP = "已清仓，按卖出成交均价相对昨收推算";
+const CLOSED_PROXY_TIP = "已清仓，按卖出成交均价相对昨日收盘推算";
+const INTRADAY_PROXY_TIP =
+  "日内开仓平仓，按卖出均价相对买入均价推算（昨日无持仓，无昨日收盘可参考）";
+
+function proxyTipFor(r: { is_intraday: boolean }) {
+  return r.is_intraday ? INTRADAY_PROXY_TIP : CLOSED_PROXY_TIP;
+}
 
 async function fetchExecutionsForDate(date: string): Promise<Execution[]> {
   const SIZE_CANDIDATES = [100, 50, 20];
@@ -197,6 +206,8 @@ export default function Contributions() {
 
   const [selectedDate, setSelectedDate] = useState<string>("");
   const [chartMode, setChartMode] = useState<"stock" | "slot">("stock");
+  // 明细表排序方向：desc = 涨幅优先（贡献度从大到小），asc = 跌幅优先（贡献度从小到大）
+  const [detailSort, setDetailSort] = useState<"desc" | "asc">("desc");
 
   const [items, setItems] = useState<HoldingsDailyItem[]>([]);
   const [executions, setExecutions] = useState<Execution[]>([]);
@@ -204,8 +215,13 @@ export default function Contributions() {
   const [dayError, setDayError] = useState("");
   const [execError, setExecError] = useState("");
 
-  // 用于「已清股票」精确归因：拉前一交易日的 holdings/daily，提取它们的 close（= 今日 pre_close）
+  // 用于「已清股票」精确归因：拉前一交易日的 holdings/daily，
+  //   - close → 作为今日 pre_close
+  //   - slot_idx → 让清仓股票仍能正确归到原槽位，而不是被全部丢进「未分配」桶
   const [closedPreClose, setClosedPreClose] = useState<Map<string, number>>(
+    new Map()
+  );
+  const [closedPrevSlotIdx, setClosedPrevSlotIdx] = useState<Map<string, number[]>>(
     new Map()
   );
   const [closedPreCloseError, setClosedPreCloseError] = useState("");
@@ -261,12 +277,6 @@ export default function Contributions() {
       cancelled = true;
     };
   }, [selectedDate]);
-
-  const navByDate = useMemo(() => {
-    const m = new Map<string, NavPoint>();
-    for (const n of navData) m.set(n.date, n);
-    return m;
-  }, [navData]);
 
   // prev_total_value：选定日期的前一交易日总资产，作为贡献度的分母
   const { prevDate, prevTotalValue, dayReturnPct, todayTotalValue } = useMemo(() => {
@@ -330,17 +340,20 @@ export default function Contributions() {
   }, [executions]);
 
   // 当日完全卖出（开盘前持有但收盘已不在持仓）的股票：在 executions 里有 sell，
-  // 但不在 holdings/daily 的 items 里。它们仍然贡献当日 P&L。
+  // 但不在 holdings/daily 的 items 里。它们仍然贡献当日盈亏。
   const closedTodayCodes = useMemo(() => {
     const heldSet = new Set(items.map((it) => it.stock_code));
     return [...execAggByCode.keys()].filter((c) => !heldSet.has(c));
   }, [items, execAggByCode]);
 
-  // 已清股票的归因需要昨收价：拉一次前一交易日的 holdings/daily，items[].close 即为今日 pre_close
+  // 已清股票的归因需要昨日收盘：拉一次前一交易日的 holdings/daily
+  //   items[].close    → 今日 pre_close（用于精确 PnL 归因）
+  //   items[].slot_idx → 清仓股票的原槽位（用于按槽位视图正确分类）
   useEffect(() => {
     setClosedPreCloseError("");
     if (!prevDate || closedTodayCodes.length === 0) {
       setClosedPreClose(new Map());
+      setClosedPrevSlotIdx(new Map());
       return;
     }
     let cancelled = false;
@@ -349,17 +362,20 @@ export default function Contributions() {
       .then((res) => {
         if (cancelled) return;
         const need = new Set(closedTodayCodes);
-        const m = new Map<string, number>();
+        const closeMap = new Map<string, number>();
+        const slotMap = new Map<string, number[]>();
         for (const it of res.items) {
-          if (need.has(it.stock_code) && it.close != null) {
-            m.set(it.stock_code, it.close);
-          }
+          if (!need.has(it.stock_code)) continue;
+          if (it.close != null) closeMap.set(it.stock_code, it.close);
+          if (it.slot_idx?.length) slotMap.set(it.stock_code, it.slot_idx);
         }
-        setClosedPreClose(m);
+        setClosedPreClose(closeMap);
+        setClosedPrevSlotIdx(slotMap);
       })
       .catch((e) => {
         if (cancelled) return;
         setClosedPreClose(new Map());
+        setClosedPrevSlotIdx(new Map());
         setClosedPreCloseError(e instanceof Error ? e.message : String(e));
       });
     return () => {
@@ -376,13 +392,16 @@ export default function Contributions() {
       const sharesPrev = sharesToday - exec.buy_shares + exec.sell_shares;
       const suspended = it.close == null || it.pre_close == null;
 
+      // 全天持有的份额（昨持 − 当日已卖），用于 hold_pnl 的分母，避免与 sell_pnl 重复计提
+      // 已卖出份额的盈亏完全由 sell_pnl = sell_amount − preClose × sell_shares 承担
+      const sharesHeldThroughDay = sharesPrev - exec.sell_shares;
       let holdPnl = 0;
       let buyPnl = 0;
       let sellPnl = 0;
       if (!suspended) {
         const close = it.close as number;
         const preClose = it.pre_close as number;
-        holdPnl = sharesPrev * (close - preClose);
+        holdPnl = sharesHeldThroughDay * (close - preClose);
         buyPnl = close * exec.buy_shares - exec.buy_amount;
         sellPnl = exec.sell_amount - preClose * exec.sell_shares;
       }
@@ -399,6 +418,7 @@ export default function Contributions() {
         pct_chg: it.pct_chg,
         is_suspended: suspended,
         is_realtime: !!it.is_realtime,
+        is_intraday: false,
         hold_pnl: holdPnl,
         buy_pnl: buyPnl,
         sell_pnl: sellPnl,
@@ -409,40 +429,87 @@ export default function Contributions() {
       };
     });
 
-    // 当日完全卖出的股票（不在 items 里）：以昨收价（preClose）作为成本基准做精确归因
-    //   净 P&L = sell_amount − buy_amount − preClose × shares_prev
-    // 等价拆解：
-    //   buy_pnl  = preClose × buy_shares  − buy_amount     （当日买入相对昨收的盈亏）
-    //   sell_pnl = sell_amount − preClose × sell_shares    （所有卖出相对昨收的盈亏）
-    //   hold_pnl = 0（无 close mark，且无遗留持仓）
-    // 若拿不到 preClose（前日 holdings/daily 缺失或停牌），退回 0 + 标 Tag 提醒。
+    // 当日 holdings 里没有的股票，分两种子情况：
+    //
+    // (A) 昨日有持仓 → 当日全部卖出（含可能的加仓后再清）
+    //     sharesPrev = sell − buy > 0；以昨日收盘 preClose 作为成本基准：
+    //       hold_pnl = 0
+    //       buy_pnl  = preClose × buy_shares − buy_amount
+    //       sell_pnl = sell_amount − preClose × sell_shares
+    //     若拿不到 preClose（前日 holdings/daily 缺失或停牌），退回 0 + Tag 提醒。
+    //
+    // (B) 昨日无持仓 → 当日开仓后又全部卖出（纯日内 round-trip）
+    //     sharesPrev = sell − buy = 0；这种股票永远不会出现在前一交易日的 holdings/daily 里，
+    //     因此拿不到 preClose 也不应该退回 0。它的真实 PnL 完全等于 sell_amount − buy_amount，
+    //     与昨收无关。统一记为：
+    //       hold_pnl = 0
+    //       buy_pnl  = 0（按"以买入成本入账"的口径，买入瞬间无浮盈/浮亏）
+    //       sell_pnl = sell_amount − buy_amount（卖出相对买入成本的实现 PnL）
+    //     展示价用 vwap 代理：pre_close ← avg_buy，close ← avg_sell。
+    //
+    // (C) sharesPrev < 0 不应出现（无卖空），防御性归 0。
     const closedRows: ContribRow[] = closedTodayCodes.map((code) => {
       const exec = execAggByCode.get(code)!;
       const sharesPrev = exec.sell_shares - exec.buy_shares;
-      const preClose = closedPreClose.get(code) ?? null;
+      const isIntraday = sharesPrev === 0 && exec.buy_shares > 0 && exec.sell_shares > 0;
+      const avgBuyPrice =
+        exec.buy_shares > 0 ? exec.buy_amount / exec.buy_shares : null;
+      const avgSellPrice =
+        exec.sell_shares > 0 ? exec.sell_amount / exec.sell_shares : null;
+
       let buyPnl = 0;
       let sellPnl = 0;
       let totalPnl = 0;
-      if (preClose != null) {
-        buyPnl = preClose * exec.buy_shares - exec.buy_amount;
-        sellPnl = exec.sell_amount - preClose * exec.sell_shares;
-        totalPnl = buyPnl + sellPnl;
+      let preClose: number | null = null;
+      let closeProxy: number | null = null;
+
+      if (isIntraday) {
+        // 日内 round-trip：完全不依赖昨收，PnL = 卖出额 − 买入额
+        sellPnl = exec.sell_amount - exec.buy_amount;
+        totalPnl = sellPnl;
+        preClose = avgBuyPrice;
+        closeProxy = avgSellPrice;
+      } else if (sharesPrev > 0) {
+        // 昨日有持仓 → 全清
+        preClose = closedPreClose.get(code) ?? null;
+        closeProxy = avgSellPrice;
+        if (preClose != null) {
+          buyPnl = preClose * exec.buy_shares - exec.buy_amount;
+          sellPnl = exec.sell_amount - preClose * exec.sell_shares;
+          totalPnl = buyPnl + sellPnl;
+        }
       }
-      // 已清股票拿不到当日官方收盘，用「卖出成交均价」作为 close 代理：
-      //   close ≈ sell_amount / sell_shares（vwap of sells）
-      // change / pct_chg 据此对昨收推算，反映用户「实际卖出价相对昨收的偏离」。
-      const avgSellPrice =
-        exec.sell_shares > 0 ? exec.sell_amount / exec.sell_shares : null;
-      const closeProxy = avgSellPrice;
+      // sharesPrev < 0：不应到这里，保持全部 0
+
       const change =
         closeProxy != null && preClose != null ? closeProxy - preClose : null;
       const pctChg =
         change != null && preClose != null && preClose > 0
           ? (change / preClose) * 100
           : null;
+
+      // 已清股票的 slot_idx 还原顺序：
+      //   1) 优先取昨日 holdings/daily 里的 slot_idx（最权威，反映清仓前的实际归属）
+      //   2) 退而求其次从当日 executions[].slot_idx 反推（intraday round-trip 必走这条；
+      //      昨持→全清若昨日 holdings 拉取失败也会落到这条）
+      //   3) 都拿不到则回退为 []，归入「未分配」桶
+      const prevSlots = closedPrevSlotIdx.get(code);
+      let slotIdx: number[] = prevSlots ?? [];
+      if (!slotIdx.length) {
+        const execs = execsByCode.get(code) ?? [];
+        const seen = new Set<number>();
+        for (const e of execs) {
+          if (e.slot_idx != null && e.slot_idx >= 0 && !seen.has(e.slot_idx)) {
+            seen.add(e.slot_idx);
+            slotIdx.push(e.slot_idx);
+          }
+        }
+        slotIdx.sort((a, b) => a - b);
+      }
+
       return {
         stock_code: code,
-        slot_idx: [],
+        slot_idx: slotIdx,
         shares: 0,
         shares_prev: sharesPrev,
         close: closeProxy,
@@ -451,6 +518,7 @@ export default function Contributions() {
         pct_chg: pctChg,
         is_suspended: false,
         is_realtime: false,
+        is_intraday: isIntraday,
         hold_pnl: 0,
         buy_pnl: buyPnl,
         sell_pnl: sellPnl,
@@ -469,7 +537,15 @@ export default function Contributions() {
         Math.abs(totalDayPnl) > 1e-9 ? (r.total_pnl / totalDayPnl) * 100 : 0;
     }
     return all.sort((a, b) => b.contribution_pct - a.contribution_pct);
-  }, [items, execAggByCode, closedTodayCodes, closedPreClose, prevTotalValue]);
+  }, [
+    items,
+    execAggByCode,
+    execsByCode,
+    closedTodayCodes,
+    closedPreClose,
+    closedPrevSlotIdx,
+    prevTotalValue,
+  ]);
 
   const summary = useMemo(() => {
     if (!rows.length) return null;
@@ -508,8 +584,6 @@ export default function Contributions() {
       totalBuyCount,
       totalSellCount,
       tradedStocks: tradedRows.length,
-      heldStocks: rows.filter((r) => r.shares > 0).length,
-      hasRealtime: rows.some((r) => r.is_realtime),
     };
   }, [rows]);
 
@@ -622,7 +696,7 @@ export default function Contributions() {
                 : `${priceLabel}: <b style="color:${pnlColor(
                     r.change ?? 0
                   )}">${closeStr}</b>`;
-            const preCloseLine = `昨收: <b>${preCloseStr}</b>`;
+            const preCloseLine = `昨日收盘: <b>${preCloseStr}</b>`;
             const lines = [
               `<b>${r.stock_code}</b>${
                 r.slot_idx.length ? ` · #${r.slot_idx.join(",")}` : ""
@@ -775,11 +849,10 @@ export default function Contributions() {
                 )}，成本 ${fmtMoney(s.total_exec_cost, 2)}`
               );
             }
-            const topMembers = s.members.slice(0, 5);
-            if (topMembers.length) {
+            if (s.members.length) {
               lines.push(
-                `<div style="margin-top:4px;border-top:1px solid rgba(255,255,255,0.15);padding-top:4px">主要贡献:</div>` +
-                  topMembers
+                `<div style="margin-top:4px;border-top:1px solid rgba(255,255,255,0.15);padding-top:4px">成员贡献:</div>` +
+                  s.members
                     .map((m) => {
                       const c = m.partial_pct >= 0 ? POS_COLOR : NEG_COLOR;
                       const split =
@@ -792,18 +865,12 @@ export default function Contributions() {
                           ? ` <span style="color:rgba(255,255,255,0.45)">[买${ag.buy_count}/卖${ag.sell_count}]</span>`
                           : "";
                       return `${m.code}${split}: <span style="color:${c}">${fmtPct(
-                        m.partial_pct
+                        m.partial_pct,
+                        4
                       )}</span>${tradeStr}`;
                     })
                     .join("<br/>")
               );
-              if (s.members.length > 5) {
-                lines.push(
-                  `<span style="color:rgba(255,255,255,0.45)">…另 ${
-                    s.members.length - 5
-                  } 只</span>`
-                );
-              }
             }
             return lines.join("<br/>");
           },
@@ -883,6 +950,16 @@ export default function Contributions() {
         .map((n) => ({ value: n.date, label: n.date })),
     [navData]
   );
+
+  // 选中日期 = 本地"今天"时，明细表的"收盘"列展示为"现价"（盘中实时价）
+  const isToday = useMemo(() => {
+    if (!selectedDate) return false;
+    const d = new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return selectedDate === `${y}-${m}-${day}`;
+  }, [selectedDate]);
 
   const renderSlots = (slots: number[]) => {
     if (!slots.length) return <span style={{ color: "rgba(255,255,255,0.45)" }}>—</span>;
@@ -974,61 +1051,88 @@ export default function Contributions() {
       width: 140,
       render: (v: number, r: ContribRow) => {
         const isClosed = r.shares === 0;
-        const noPreClose = isClosed && r.pre_close == null;
+        const noPreClose = isClosed && !r.is_intraday && r.pre_close == null;
         const tip = noPreClose ? (
           <div style={{ lineHeight: 1.6 }}>
-            <div>已清仓，前一交易日无 close 数据，无法精确归因</div>
+            <div>已清仓，前一交易日无收盘数据，无法精确归因</div>
             <div style={{ color: "rgba(255,255,255,0.45)" }}>
               卖出 ¥{r.exec.sell_amount.toFixed(2)} − 买入 ¥
-              {r.exec.buy_amount.toFixed(2)}（仅供参考，未反映真实 P&L）
+              {r.exec.buy_amount.toFixed(2)}（仅供参考，未反映真实盈亏）
+            </div>
+          </div>
+        ) : r.is_intraday ? (
+          <div style={{ lineHeight: 1.6 }}>
+            <div style={{ marginBottom: 4 }}>
+              日内开仓平仓（昨日无持仓），按买入成本作为基准：
+            </div>
+            <div>
+              实现盈亏: <b>{fmtMoney(r.sell_pnl, 2)}</b>
+              <span style={{ color: "rgba(255,255,255,0.45)", marginLeft: 6 }}>
+                = 卖出 {fmtMoney(r.exec.sell_amount, 2)} − 买入{" "}
+                {fmtMoney(r.exec.buy_amount, 2)}
+              </span>
+            </div>
+            <div style={{ color: "rgba(255,255,255,0.45)" }}>
+              均价 买入 {r.pre_close?.toFixed(2) ?? "—"} → 卖出{" "}
+              {r.close?.toFixed(2) ?? "—"}（{r.exec.buy_shares.toFixed(0)} 股 ×{" "}
+              {r.exec.buy_count} 笔买 / {r.exec.sell_count} 笔卖）
             </div>
           </div>
         ) : isClosed ? (
           <div style={{ lineHeight: 1.6 }}>
             <div style={{ marginBottom: 4 }}>
-              已清仓，按昨收 <b>{r.pre_close?.toFixed(2)}</b> 作为成本基准：
+              已清仓，按昨日收盘 <b>{r.pre_close?.toFixed(2)}</b> 作为成本基准：
             </div>
             <div>
-              买入 P&L: <b>{fmtMoney(r.buy_pnl, 2)}</b>
+              买入盈亏: <b>{fmtMoney(r.buy_pnl, 2)}</b>
               <span style={{ color: "rgba(255,255,255,0.45)", marginLeft: 6 }}>
                 = {r.pre_close?.toFixed(2)}×{r.exec.buy_shares.toFixed(0)} −{" "}
                 {fmtMoney(r.exec.buy_amount, 2)}
               </span>
             </div>
             <div>
-              卖出 P&L: <b>{fmtMoney(r.sell_pnl, 2)}</b>
+              卖出盈亏: <b>{fmtMoney(r.sell_pnl, 2)}</b>
               <span style={{ color: "rgba(255,255,255,0.45)", marginLeft: 6 }}>
                 = {fmtMoney(r.exec.sell_amount, 2)} − {r.pre_close?.toFixed(2)}×
                 {r.exec.sell_shares.toFixed(0)}
               </span>
             </div>
-            <div style={{ marginTop: 4, fontSize: 11, color: "rgba(255,255,255,0.45)" }}>
-              净 P&L = sell_amount − buy_amount − pre_close × shares_prev
-            </div>
           </div>
         ) : (
-          <div style={{ lineHeight: 1.6 }}>
-            <div>
-              持仓 P&L: <b>{fmtMoney(r.hold_pnl, 2)}</b>
-              <span style={{ color: "rgba(255,255,255,0.45)", marginLeft: 6 }}>
-                = {r.shares_prev.toFixed(0)} ×{" "}
-                ({r.close ?? "—"} − {r.pre_close ?? "—"})
-              </span>
-            </div>
-            <div>
-              买入 P&L: <b>{fmtMoney(r.buy_pnl, 2)}</b>
-              <span style={{ color: "rgba(255,255,255,0.45)", marginLeft: 6 }}>
-                = close×{r.exec.buy_shares.toFixed(0)} − {fmtMoney(r.exec.buy_amount, 2)}
-              </span>
-            </div>
-            <div>
-              卖出 P&L: <b>{fmtMoney(r.sell_pnl, 2)}</b>
-              <span style={{ color: "rgba(255,255,255,0.45)", marginLeft: 6 }}>
-                = {fmtMoney(r.exec.sell_amount, 2)} − pre_close×
-                {r.exec.sell_shares.toFixed(0)}
-              </span>
-            </div>
-          </div>
+          (() => {
+            const sharesHeldThroughDay = r.shares_prev - r.exec.sell_shares;
+            return (
+              <div style={{ lineHeight: 1.6 }}>
+                <div>
+                  持仓盈亏: <b>{fmtMoney(r.hold_pnl, 2)}</b>
+                  <span style={{ color: "rgba(255,255,255,0.45)", marginLeft: 6 }}>
+                    = {sharesHeldThroughDay.toFixed(0)} ×{" "}
+                    ({r.close ?? "—"} − {r.pre_close ?? "—"})
+                    {r.exec.sell_shares > 0 && (
+                      <span style={{ marginLeft: 4 }}>
+                        （全天持有 = 昨持 {r.shares_prev.toFixed(0)} − 当日卖出{" "}
+                        {r.exec.sell_shares.toFixed(0)}）
+                      </span>
+                    )}
+                  </span>
+                </div>
+                <div>
+                  买入盈亏: <b>{fmtMoney(r.buy_pnl, 2)}</b>
+                  <span style={{ color: "rgba(255,255,255,0.45)", marginLeft: 6 }}>
+                    = {isToday ? "现价" : "收盘"}×{r.exec.buy_shares.toFixed(0)} −{" "}
+                    {fmtMoney(r.exec.buy_amount, 2)}
+                  </span>
+                </div>
+                <div>
+                  卖出盈亏: <b>{fmtMoney(r.sell_pnl, 2)}</b>
+                  <span style={{ color: "rgba(255,255,255,0.45)", marginLeft: 6 }}>
+                    = {fmtMoney(r.exec.sell_amount, 2)} − 昨日收盘×
+                    {r.exec.sell_shares.toFixed(0)}
+                  </span>
+                </div>
+              </div>
+            );
+          })()
         );
         return (
           <Tooltip title={tip}>
@@ -1053,7 +1157,7 @@ export default function Contributions() {
       render: (v: number | null, r: ContribRow) => {
         if (v == null) return <span style={{ color: "rgba(255,255,255,0.45)" }}>—</span>;
         return (
-          <ClosedProxyCell proxy={r.shares === 0} title={CLOSED_PROXY_TIP}>
+          <ClosedProxyCell proxy={r.shares === 0} title={proxyTipFor(r)}>
             <span style={{ color: pnlColor(v) }}>{fmtPct(v)}</span>
           </ClosedProxyCell>
         );
@@ -1067,7 +1171,7 @@ export default function Contributions() {
       render: (v: number | null, r: ContribRow) => {
         if (v == null) return "—";
         return (
-          <ClosedProxyCell proxy={r.shares === 0} title={CLOSED_PROXY_TIP}>
+          <ClosedProxyCell proxy={r.shares === 0} title={proxyTipFor(r)}>
             <span style={{ color: pnlColor(v) }}>
               {(v >= 0 ? "+" : "") + v.toFixed(2)}
             </span>
@@ -1076,18 +1180,23 @@ export default function Contributions() {
       },
     },
     {
-      title: "收盘",
+      title: isToday ? "现价" : "收盘",
       dataIndex: "close",
       key: "close",
       width: 90,
       render: (v: number | null, r: ContribRow) => {
         if (v == null) return "—";
+        const closeTitle = r.is_intraday
+          ? `日内卖出均价 = ¥${r.exec.sell_amount.toFixed(2)} ÷ ${r.exec.sell_shares.toFixed(
+              0
+            )} 股`
+          : `已清仓，显示为卖出成交均价 = ¥${r.exec.sell_amount.toFixed(
+              2
+            )} ÷ ${r.exec.sell_shares.toFixed(0)} 股`;
         return (
           <ClosedProxyCell
             proxy={r.shares === 0}
-            title={`已清仓，显示为卖出成交均价 = ¥${r.exec.sell_amount.toFixed(
-              2
-            )} ÷ ${r.exec.sell_shares.toFixed(0)} 股`}
+            title={closeTitle}
           >
             <span>{v.toFixed(2)}</span>
           </ClosedProxyCell>
@@ -1095,7 +1204,7 @@ export default function Contributions() {
       },
     },
     {
-      title: "昨收",
+      title: "昨日收盘",
       dataIndex: "pre_close",
       key: "pre_close",
       width: 90,
@@ -1181,7 +1290,7 @@ export default function Contributions() {
       render: (v: number | null, r: ContribRow) => {
         if (v == null) return <span style={{ color: "rgba(255,255,255,0.45)" }}>—</span>;
         return (
-          <ClosedProxyCell proxy={r.shares === 0} title={CLOSED_PROXY_TIP}>
+          <ClosedProxyCell proxy={r.shares === 0} title={proxyTipFor(r)}>
             <span style={{ color: pnlColor(v) }}>{fmtPct(v)}</span>
           </ClosedProxyCell>
         );
@@ -1252,7 +1361,7 @@ export default function Contributions() {
             title={
               <span>
                 持仓贡献合计{" "}
-                <Tooltip title="所有股票 P&L 之和。若与「组合涨跌 × 前一交易日总资产」存在差额，通常来自现金/非持仓项变动或除权调整误差。">
+                <Tooltip title="所有股票盈亏之和。若与「组合涨跌 × 前一交易日总资产」存在差额，通常来自现金/非持仓项变动或除权调整误差。">
                   <InfoCircleOutlined style={{ color: "rgba(255,255,255,0.45)" }} />
                 </Tooltip>
               </span>
@@ -1390,7 +1499,7 @@ export default function Contributions() {
       {closedPreCloseError && (
         <Alert
           type="warning"
-          message={`已清股票的昨收拉取失败：${closedPreCloseError}（其贡献度暂计为 0）`}
+          message={`已清股票的昨日收盘拉取失败：${closedPreCloseError}（其贡献度暂计为 0）`}
           style={{ marginBottom: 12 }}
           showIcon
           closable
@@ -1513,71 +1622,72 @@ export default function Contributions() {
               )}
             </Card>
             {(() => {
-              const gainRows = [...rows]
-                .filter((r) => r.contribution_pct > 0)
-                .sort((a, b) => b.contribution_pct - a.contribution_pct);
-              const lossRows = [...rows]
-                .filter((r) => r.contribution_pct < 0)
-                .sort((a, b) => a.contribution_pct - b.contribution_pct);
-              const tableProps = {
-                columns: isMobile ? mobileColumns : columns,
-                rowKey: "stock_code" as const,
-                size: "small" as const,
-                pagination: {
-                  defaultPageSize: 20,
-                  showSizeChanger: !isMobile,
-                  pageSizeOptions: ["20", "50", "100"],
-                  size: isMobile ? ("small" as const) : undefined,
-                  showTotal: (total: number) => `共 ${total} 只`,
-                },
-                scroll: { x: isMobile ? 440 : 1300 },
-              };
+              const sortedRows = [...rows].sort((a, b) =>
+                detailSort === "desc"
+                  ? b.contribution_pct - a.contribution_pct
+                  : a.contribution_pct - b.contribution_pct
+              );
               return (
-                <>
-                  <Card
-                    size="small"
-                    title={
+                <Card
+                  size="small"
+                  title={
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        flexWrap: "wrap",
+                        gap: 8,
+                      }}
+                    >
                       <span style={{ fontSize: isMobile ? 13 : 14 }}>
-                        <RiseOutlined
-                          style={{ color: POS_COLOR, marginRight: 6 }}
-                        />
-                        个股贡献度明细 · 涨
+                        个股贡献度明细
                       </span>
-                    }
-                    styles={{ body: { padding: 0 } }}
-                    style={{ marginBottom: 12 }}
-                  >
-                    {gainRows.length ? (
-                      <Table dataSource={gainRows} {...tableProps} />
-                    ) : (
-                      <Empty
-                        description="无正贡献"
-                        style={{ padding: isMobile ? 30 : 60 }}
+                      <Segmented
+                        size={isMobile ? "small" : "middle"}
+                        value={detailSort}
+                        onChange={(v) => setDetailSort(v as "desc" | "asc")}
+                        options={[
+                          {
+                            label: (
+                              <span style={{ color: POS_COLOR }}>涨</span>
+                            ),
+                            value: "desc",
+                          },
+                          {
+                            label: (
+                              <span style={{ color: NEG_COLOR }}>跌</span>
+                            ),
+                            value: "asc",
+                          },
+                        ]}
                       />
-                    )}
-                  </Card>
-                  <Card
-                    size="small"
-                    title={
-                      <span style={{ fontSize: isMobile ? 13 : 14 }}>
-                        <FallOutlined
-                          style={{ color: NEG_COLOR, marginRight: 6 }}
-                        />
-                        个股贡献度明细 · 跌
-                      </span>
-                    }
-                    styles={{ body: { padding: 0 } }}
-                  >
-                    {lossRows.length ? (
-                      <Table dataSource={lossRows} {...tableProps} />
-                    ) : (
-                      <Empty
-                        description="无负贡献"
-                        style={{ padding: isMobile ? 30 : 60 }}
-                      />
-                    )}
-                  </Card>
-                </>
+                    </div>
+                  }
+                  styles={{ body: { padding: 0 } }}
+                >
+                  {sortedRows.length ? (
+                    <Table
+                      dataSource={sortedRows}
+                      columns={isMobile ? mobileColumns : columns}
+                      rowKey="stock_code"
+                      size="small"
+                      pagination={{
+                        defaultPageSize: 20,
+                        showSizeChanger: !isMobile,
+                        pageSizeOptions: ["20", "50", "100"],
+                        size: isMobile ? "small" : undefined,
+                        showTotal: (total) => `共 ${total} 只`,
+                      }}
+                      scroll={{ x: isMobile ? 440 : 1300 }}
+                    />
+                  ) : (
+                    <Empty
+                      description="暂无数据"
+                      style={{ padding: isMobile ? 30 : 60 }}
+                    />
+                  )}
+                </Card>
               );
             })()}
           </>
