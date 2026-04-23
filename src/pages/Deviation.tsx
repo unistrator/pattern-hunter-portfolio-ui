@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   Card,
   Spin,
@@ -12,6 +12,8 @@ import {
   DatePicker,
   Select,
   Space,
+  Segmented,
+  Table,
 } from "antd";
 import {
   ArrowUpOutlined,
@@ -58,6 +60,51 @@ function pnlColor(v: number | null | undefined) {
   if (v > 0) return POS_COLOR;
   if (v < 0) return NEG_COLOR;
   return NEUTRAL_COLOR;
+}
+
+function buildScrollDataZoom(endPercent: number) {
+  return [
+    {
+      type: "slider" as const,
+      show: true,
+      xAxisIndex: 0,
+      start: 0,
+      end: endPercent,
+      height: 10,
+      bottom: 4,
+      brushSelect: false,
+      zoomLock: true,
+      showDetail: false,
+      showDataShadow: false,
+      handleSize: 0,
+      moveHandleSize: 0,
+      fillerColor: "rgba(255,255,255,0.25)",
+      borderColor: "transparent",
+      backgroundColor: "rgba(255,255,255,0.06)",
+    },
+    {
+      type: "inside" as const,
+      xAxisIndex: 0,
+      start: 0,
+      end: endPercent,
+      zoomLock: true,
+    },
+  ];
+}
+
+function computeAxisRange(values: number[]) {
+  const rawMin = Math.min(0, ...values);
+  const rawMax = Math.max(0, ...values);
+  const span = rawMax - rawMin || 1;
+  const pad = span * 0.1;
+  const yMin = rawMin < 0 ? Number((rawMin - pad).toFixed(4)) : 0;
+  const yMax = rawMax > 0 ? Number((rawMax + pad).toFixed(4)) : 0;
+  return { yMin, yMax };
+}
+
+function slotKey(slots: number[]): string {
+  if (!slots || !slots.length) return "未分配";
+  return slots.map((s) => `#${s}`).join(",");
 }
 
 // ---- 数据获取 -------------------------------------------------------------
@@ -132,6 +179,8 @@ export default function Deviation() {
 
   const [range, setRange] = useState<[Dayjs, Dayjs] | null>(null);
   const [selectedIndex, setSelectedIndex] = useState<string>("000905.SH");
+  const [chartMode, setChartMode] = useState<"stock" | "slot">("stock");
+  const [tableSort, setTableSort] = useState<"gain" | "loss">("gain");
 
   const [holdingsByDate, setHoldingsByDate] = useState<
     Map<string, HoldingsDailyResponse>
@@ -340,11 +389,16 @@ export default function Deviation() {
         const r = ensureRow(code);
         if (it.is_realtime) r.has_realtime = true;
 
-        // 用收盘价计算权重（停牌时 close 为 null，权重无法估，跳过当日）
-        if (it.close == null) {
-          r.has_suspended_day = true;
+        // 估权重的价格：优先 close，停牌时回退 pre_close（保证停牌仓位仍计入归因）
+        const suspended = it.close == null;
+        const priceForWeight =
+          it.close != null ? it.close : it.pre_close ?? null;
+
+        if (suspended) r.has_suspended_day = true;
+
+        if (priceForWeight == null) {
+          // 完全没有价格（连昨收都缺），无法估权重，仅记 active_days 和 slot
           r.active_days += 1;
-          // 当日没有 pct_chg 也无法贡献，但 latest_slot_idx 仍记
           if (it.slot_idx?.length) lastSlotByCode.set(code, it.slot_idx);
           if (d === lastDay) {
             r.held_at_end = it.shares > 0;
@@ -353,7 +407,7 @@ export default function Deviation() {
           continue;
         }
 
-        const w = (it.shares * it.close) / totalValue; // 0~1
+        const w = (it.shares * priceForWeight) / totalValue; // 0~1
         positionWeightSum += w;
 
         r.active_days += 1;
@@ -365,12 +419,16 @@ export default function Deviation() {
           r.latest_slot_idx = it.slot_idx ?? [];
         }
 
-        const stockPct = it.pct_chg; // null 表示停牌或缺数据
-        if (stockPct == null) {
+        // 停牌当日个股 pct_chg 视为 0（个股不动），但仍参与与基准的对比
+        let stockPct: number | null;
+        if (suspended) {
+          stockPct = 0;
+        } else if (it.pct_chg == null) {
+          // 非停牌但缺涨跌幅（极少数数据缺失），权重计入但不贡献
           r.missing_pct_days += 1;
-          // 不参与贡献，但权重已计
-          // 累乘序列也跳过
           continue;
+        } else {
+          stockPct = it.pct_chg;
         }
 
         // 单日贡献（百分比点）
@@ -385,7 +443,7 @@ export default function Deviation() {
           r.excess_contrib_pct += retC;
         }
 
-        // 累乘准备：股票区间真实涨跌 = Π(1 + pct_chg/100) − 1
+        // 累乘准备：股票区间真实涨跌 = Π(1 + pct_chg/100) − 1（停牌当 0 计入）
         let arr = pctSeriesByCode.get(code);
         if (!arr) {
           arr = [];
@@ -550,6 +608,563 @@ export default function Deviation() {
   const indexLabel =
     INDEX_OPTIONS.find((o) => o.value === selectedIndex)?.label ?? selectedIndex;
 
+  // 5) 按槽位聚合的偏离归因（用 latest_slot_idx 作为分组键；多槽位股票把贡献按槽位均摊）
+  const slotRows = useMemo(() => {
+    if (!result) return [] as Array<{
+      slot_label: string;
+      excess_contrib_pct: number;
+      ret_contrib_pct: number;
+      bench_contrib_pct: number;
+      sum_weight: number;
+      stock_count: number;
+      members: Array<{ code: string; partial_pct: number }>;
+    }>;
+    const map = new Map<
+      string,
+      {
+        slot_label: string;
+        excess_contrib_pct: number;
+        ret_contrib_pct: number;
+        bench_contrib_pct: number;
+        sum_weight: number;
+        codes: Set<string>;
+        members: Array<{ code: string; partial_pct: number }>;
+      }
+    >();
+    for (const r of result.rows) {
+      const slots = r.latest_slot_idx?.length ? r.latest_slot_idx : [];
+      const n = Math.max(1, slots.length);
+      const labels = slots.length ? slots.map((s) => `#${s}`) : ["未分配"];
+      for (const label of labels) {
+        let agg = map.get(label);
+        if (!agg) {
+          agg = {
+            slot_label: label,
+            excess_contrib_pct: 0,
+            ret_contrib_pct: 0,
+            bench_contrib_pct: 0,
+            sum_weight: 0,
+            codes: new Set(),
+            members: [],
+          };
+          map.set(label, agg);
+        }
+        const partial = r.excess_contrib_pct / n;
+        agg.excess_contrib_pct += partial;
+        agg.ret_contrib_pct += r.ret_contrib_pct / n;
+        agg.bench_contrib_pct += r.bench_contrib_pct / n;
+        agg.sum_weight += r.sum_weight / n;
+        agg.codes.add(r.stock_code);
+        agg.members.push({ code: r.stock_code, partial_pct: partial });
+      }
+    }
+    for (const agg of map.values()) {
+      agg.members.sort(
+        (a, b) => Math.abs(b.partial_pct) - Math.abs(a.partial_pct)
+      );
+    }
+    return [...map.values()]
+      .map((agg) => ({
+        slot_label: agg.slot_label,
+        excess_contrib_pct: agg.excess_contrib_pct,
+        ret_contrib_pct: agg.ret_contrib_pct,
+        bench_contrib_pct: agg.bench_contrib_pct,
+        sum_weight: agg.sum_weight,
+        stock_count: agg.codes.size,
+        members: agg.members,
+      }))
+      .sort((a, b) => b.excess_contrib_pct - a.excess_contrib_pct);
+  }, [result]);
+
+  // 6) 偏离归因图表 option（按股票 / 按槽位，正/负分两图）
+  const attribOptions = useMemo(() => {
+    const buildStockOption = (
+      subset: DeviationRow[],
+      color: string,
+      isLoss = false
+    ) => {
+      if (!subset.length) return null;
+      const initialWindow = 30;
+      const sorted = [...subset].sort(
+        (a, b) =>
+          Math.abs(b.excess_contrib_pct) - Math.abs(a.excess_contrib_pct)
+      );
+      const codes = sorted.map((r) => r.stock_code);
+      const data = sorted.map((r) => ({
+        value: Number(r.excess_contrib_pct.toFixed(4)),
+        itemStyle: { color },
+      }));
+      const needZoom = sorted.length > initialWindow;
+      const endPercent = needZoom
+        ? Math.min(100, (initialWindow / sorted.length) * 100)
+        : 100;
+      const { yMin, yMax } = computeAxisRange(data.map((d) => d.value));
+      return {
+        tooltip: {
+          trigger: "axis" as const,
+          confine: true,
+          axisPointer: { type: "shadow" as const },
+          formatter: (params: any) => {
+            if (!Array.isArray(params) || !params.length) return "";
+            const p = params[0];
+            const r = sorted[p.dataIndex];
+            if (!r) return "";
+            const lines = [
+              `<b>${r.stock_code}</b>${
+                r.latest_slot_idx.length
+                  ? ` · #${r.latest_slot_idx.join(",")}`
+                  : ""
+              }`,
+              `超额贡献: <b>${fmtPct(r.excess_contrib_pct, 4)}</b>`,
+              `个股贡献: <span style="color:${pnlColor(
+                r.ret_contrib_pct
+              )}">${fmtPct(r.ret_contrib_pct, 4)}</span>`,
+              `基准贡献: <span style="color:${pnlColor(
+                r.bench_contrib_pct
+              )}">${fmtPct(r.bench_contrib_pct, 4)}</span>`,
+              `平均权重: ${(r.avg_weight * 100).toFixed(2)}%`,
+              `区间真实涨跌: <span style="color:${pnlColor(
+                r.stock_period_return_pct
+              )}">${fmtPct(r.stock_period_return_pct, 2)}</span>`,
+              `活跃天数: ${r.active_days}`,
+            ];
+            if (r.has_suspended_day) {
+              lines.push('<span style="color:#faad14">含停牌天</span>');
+            }
+            if (r.missing_pct_days > 0) {
+              lines.push(
+                `<span style="color:#faad14">缺涨跌幅天数: ${r.missing_pct_days}</span>`
+              );
+            }
+            if (r.has_realtime) {
+              lines.push('<span style="color:#1677ff">含实时数据</span>');
+            }
+            return lines.join("<br/>");
+          },
+        },
+        grid: isMobile
+          ? {
+              left: 56,
+              right: 16,
+              top: 36,
+              bottom: needZoom ? 30 : 8,
+              containLabel: true,
+            }
+          : {
+              left: 64,
+              right: 30,
+              top: 40,
+              bottom: needZoom ? 32 : 10,
+              containLabel: true,
+            },
+        dataZoom: needZoom ? buildScrollDataZoom(endPercent) : undefined,
+        xAxis: {
+          type: "category" as const,
+          data: codes,
+          axisLabel: {
+            rotate: isMobile ? 60 : 45,
+            fontSize: isMobile ? 9 : 11,
+            interval: 0,
+          },
+        },
+        yAxis: {
+          type: "value" as const,
+          name: "超额贡献 %",
+          nameLocation: "end" as const,
+          nameGap: 14,
+          nameTextStyle: { fontSize: 11, color: "rgba(255,255,255,0.65)" },
+          axisLabel: { formatter: (v: number) => v.toFixed(2) },
+          min: yMin,
+          max: yMax,
+        },
+        series: [
+          {
+            type: "bar" as const,
+            data,
+            barMaxWidth: 24,
+            label: {
+              show: !isMobile,
+              position: (isLoss ? "bottom" : "top") as "top" | "bottom",
+              fontSize: 10,
+              formatter: (p: any) => (p.value as number).toFixed(2),
+            },
+          },
+        ],
+      };
+    };
+
+    const buildSlotOption = (
+      subset: typeof slotRows,
+      color: string,
+      isLoss = false
+    ) => {
+      if (!subset.length) return null;
+      const sorted = [...subset].sort(
+        (a, b) =>
+          Math.abs(b.excess_contrib_pct) - Math.abs(a.excess_contrib_pct)
+      );
+      const labels = sorted.map((s) => s.slot_label);
+      const data = sorted.map((s) => ({
+        value: Number(s.excess_contrib_pct.toFixed(4)),
+        itemStyle: { color },
+      }));
+      const initialSlotWindow = 30;
+      const needZoom = sorted.length > initialSlotWindow;
+      const endPercent = needZoom
+        ? Math.min(100, (initialSlotWindow / sorted.length) * 100)
+        : 100;
+      const { yMin, yMax } = computeAxisRange(data.map((d) => d.value));
+      return {
+        tooltip: {
+          trigger: "axis" as const,
+          confine: true,
+          axisPointer: { type: "shadow" as const },
+          formatter: (params: any) => {
+            if (!Array.isArray(params) || !params.length) return "";
+            const p = params[0];
+            const s = sorted[p.dataIndex];
+            if (!s) return "";
+            const lines = [
+              `<b>${s.slot_label === "未分配" ? "未分配 / 已清" : `槽位 ${s.slot_label}`}</b>`,
+              `超额贡献: <b>${fmtPct(s.excess_contrib_pct, 4)}</b>`,
+              `个股贡献: <span style="color:${pnlColor(
+                s.ret_contrib_pct
+              )}">${fmtPct(s.ret_contrib_pct, 4)}</span>`,
+              `基准贡献: <span style="color:${pnlColor(
+                s.bench_contrib_pct
+              )}">${fmtPct(s.bench_contrib_pct, 4)}</span>`,
+              `成员: ${s.stock_count} 只`,
+            ];
+            if (s.members.length) {
+              const head =
+                '<div style="margin-top:4px;border-top:1px solid rgba(255,255,255,0.15);padding-top:4px">成员超额贡献:</div>';
+              const body = s.members
+                .slice(0, 10)
+                .map((m) => {
+                  const c = m.partial_pct >= 0 ? POS_COLOR : NEG_COLOR;
+                  return `${m.code}: <span style="color:${c}">${fmtPct(
+                    m.partial_pct,
+                    4
+                  )}</span>`;
+                })
+                .join("<br/>");
+              lines.push(head + body);
+              if (s.members.length > 10) {
+                lines.push(
+                  `<span style="color:rgba(255,255,255,0.45)">…及其他 ${
+                    s.members.length - 10
+                  } 只</span>`
+                );
+              }
+            }
+            return lines.join("<br/>");
+          },
+        },
+        grid: isMobile
+          ? {
+              left: 56,
+              right: 16,
+              top: 36,
+              bottom: needZoom ? 26 : 8,
+              containLabel: true,
+            }
+          : {
+              left: 64,
+              right: 30,
+              top: 40,
+              bottom: needZoom ? 28 : 10,
+              containLabel: true,
+            },
+        dataZoom: needZoom ? buildScrollDataZoom(endPercent) : undefined,
+        xAxis: {
+          type: "category" as const,
+          data: labels,
+          axisLabel: {
+            rotate: 0,
+            fontSize: isMobile ? 10 : 12,
+            interval: 0,
+          },
+        },
+        yAxis: {
+          type: "value" as const,
+          name: "超额贡献 %",
+          nameLocation: "end" as const,
+          nameGap: 14,
+          nameTextStyle: { fontSize: 11, color: "rgba(255,255,255,0.65)" },
+          axisLabel: { formatter: (v: number) => v.toFixed(2) },
+          min: yMin,
+          max: yMax,
+        },
+        series: [
+          {
+            type: "bar" as const,
+            data,
+            barMaxWidth: 32,
+            label: {
+              show: true,
+              position: (isLoss ? "bottom" : "top") as "top" | "bottom",
+              fontSize: isMobile ? 9 : 10,
+              formatter: (p: any) => (p.value as number).toFixed(2),
+            },
+          },
+        ],
+      };
+    };
+
+    if (!result) return { gain: null, loss: null };
+    if (chartMode === "slot") {
+      const positives = slotRows.filter((s) => s.excess_contrib_pct > 0);
+      const negatives = slotRows.filter((s) => s.excess_contrib_pct < 0);
+      return {
+        gain: buildSlotOption(positives, POS_COLOR),
+        loss: buildSlotOption(negatives, NEG_COLOR, true),
+      };
+    }
+    const positives = result.rows.filter((r) => r.excess_contrib_pct > 0);
+    const negatives = result.rows.filter((r) => r.excess_contrib_pct < 0);
+    return {
+      gain: buildStockOption(positives, POS_COLOR),
+      loss: buildStockOption(negatives, NEG_COLOR, true),
+    };
+  }, [result, slotRows, chartMode, isMobile]);
+
+  // 7) 偏离归因 · 每日超额柱状（Σ 个股权重×(个股 pct − 基准 pct)）
+  const dailyExcessOption = useMemo(() => {
+    if (!result || !tradingDays.length) return null;
+    const dates: string[] = [];
+    const values: number[] = [];
+    for (const d of tradingDays) {
+      const hold = holdingsByDate.get(d);
+      const navPoint = navByDate.get(d);
+      const idxPt = indexByDate.get(d);
+      const benchPct = idxPt?.pct_chg;
+      if (!hold || !navPoint?.total_value || benchPct == null) {
+        dates.push(d);
+        values.push(0);
+        continue;
+      }
+      const totalValue = navPoint.total_value;
+      let excess = 0;
+      for (const it of hold.items) {
+        if (it.close == null || it.pct_chg == null) continue;
+        const w = (it.shares * it.close) / totalValue;
+        excess += w * (it.pct_chg - benchPct);
+      }
+      dates.push(d);
+      values.push(Number(excess.toFixed(4)));
+    }
+    if (!values.length) return null;
+    const { yMin, yMax } = computeAxisRange(values);
+    return {
+      tooltip: {
+        trigger: "axis" as const,
+        confine: true,
+        axisPointer: { type: "shadow" as const },
+        formatter: (params: any) => {
+          if (!Array.isArray(params) || !params.length) return "";
+          const p = params[0];
+          const v = p.value as number;
+          return `${p.axisValueLabel}<br/>${p.marker} 当日超额(线性): <b style="color:${pnlColor(
+            v
+          )}">${fmtPct(v, 4)}</b>`;
+        },
+      },
+      grid: isMobile
+        ? { left: 50, right: 16, top: 30, bottom: 36, containLabel: true }
+        : { left: 64, right: 30, top: 40, bottom: 30, containLabel: true },
+      xAxis: {
+        type: "category" as const,
+        data: dates,
+        axisLabel: isMobile ? { rotate: 45, fontSize: 10 } : { rotate: 30 },
+      },
+      yAxis: {
+        type: "value" as const,
+        name: "超额 %",
+        axisLabel: { formatter: (v: number) => v.toFixed(2) },
+        min: yMin,
+        max: yMax,
+      },
+      series: [
+        {
+          type: "bar" as const,
+          data: values.map((v) => ({
+            value: v,
+            itemStyle: { color: v >= 0 ? POS_COLOR : NEG_COLOR },
+          })),
+          barMaxWidth: 18,
+        },
+      ],
+    };
+  }, [result, tradingDays, holdingsByDate, navByDate, indexByDate, isMobile]);
+
+  // 8) 明细表格 columns
+  const tableColumns = useMemo(
+    () => [
+      {
+        title: "股票代码",
+        dataIndex: "stock_code",
+        key: "stock_code",
+        fixed: "left" as const,
+        width: 130,
+      },
+      {
+        title: () => (
+          <span>
+            槽位{" "}
+            <Tooltip title="按区间末日所属槽位展示。区间内换过槽位的股票仅反映末位状态。">
+              <InfoCircleOutlined style={{ color: "rgba(255,255,255,0.45)" }} />
+            </Tooltip>
+          </span>
+        ),
+        dataIndex: "latest_slot_idx",
+        key: "latest_slot_idx",
+        width: 110,
+        render: (slots: number[]) => {
+          if (!slots?.length)
+            return <span style={{ color: "rgba(255,255,255,0.45)" }}>—</span>;
+          return (
+            <span>
+              {slots.map((s) => (
+                <Tag color="blue" key={s} style={{ marginRight: 2 }}>
+                  #{s}
+                </Tag>
+              ))}
+            </span>
+          );
+        },
+      },
+      {
+        title: () => (
+          <span>
+            平均权重{" "}
+            <Tooltip title="区间内 Σ 当日权重 / 活跃天数。当日权重 = shares × close / nav.total_value">
+              <InfoCircleOutlined style={{ color: "rgba(255,255,255,0.45)" }} />
+            </Tooltip>
+          </span>
+        ),
+        dataIndex: "avg_weight",
+        key: "avg_weight",
+        width: 110,
+        render: (v: number) => `${(v * 100).toFixed(2)}%`,
+      },
+      {
+        title: () => (
+          <span>
+            个股贡献{" "}
+            <Tooltip title="Σ 当日权重 × 个股当日 pct_chg（百分点，线性近似）">
+              <InfoCircleOutlined style={{ color: "rgba(255,255,255,0.45)" }} />
+            </Tooltip>
+          </span>
+        ),
+        dataIndex: "ret_contrib_pct",
+        key: "ret_contrib_pct",
+        width: 120,
+        render: (v: number) => (
+          <span style={{ color: pnlColor(v) }}>{fmtPct(v, 4)}</span>
+        ),
+      },
+      {
+        title: () => (
+          <span>
+            基准贡献{" "}
+            <Tooltip title="Σ 当日权重 × 基准当日 pct_chg（假设这块仓位换成指数）">
+              <InfoCircleOutlined style={{ color: "rgba(255,255,255,0.45)" }} />
+            </Tooltip>
+          </span>
+        ),
+        dataIndex: "bench_contrib_pct",
+        key: "bench_contrib_pct",
+        width: 120,
+        render: (v: number) => (
+          <span style={{ color: pnlColor(v) }}>{fmtPct(v, 4)}</span>
+        ),
+      },
+      {
+        title: () => (
+          <span>
+            超额贡献{" "}
+            <Tooltip title="Σ 当日权重 × (个股 pct_chg − 基准 pct_chg)，该股对组合 vs 基准超额的累计贡献">
+              <InfoCircleOutlined style={{ color: "rgba(255,255,255,0.45)" }} />
+            </Tooltip>
+          </span>
+        ),
+        dataIndex: "excess_contrib_pct",
+        key: "excess_contrib_pct",
+        width: 130,
+        render: (v: number) => (
+          <span style={{ color: pnlColor(v), fontWeight: 600 }}>
+            {fmtPct(v, 4)}
+          </span>
+        ),
+      },
+      {
+        title: () => (
+          <span>
+            区间涨跌{" "}
+            <Tooltip title="个股区间真实复利涨跌：Π(1 + pct_chg/100) − 1">
+              <InfoCircleOutlined style={{ color: "rgba(255,255,255,0.45)" }} />
+            </Tooltip>
+          </span>
+        ),
+        dataIndex: "stock_period_return_pct",
+        key: "stock_period_return_pct",
+        width: 110,
+        render: (v: number | null) => (
+          <span style={{ color: pnlColor(v) }}>{fmtPct(v, 2)}</span>
+        ),
+      },
+      {
+        title: "活跃天数",
+        dataIndex: "active_days",
+        key: "active_days",
+        width: 90,
+      },
+      {
+        title: "数据质量",
+        key: "quality",
+        width: 130,
+        render: (_: unknown, r: DeviationRow) => {
+          const tags: ReactNode[] = [];
+          if (r.has_realtime)
+            tags.push(
+              <Tag color="blue" key="rt">
+                实时
+              </Tag>
+            );
+          if (r.has_suspended_day)
+            tags.push(
+              <Tag color="orange" key="sus">
+                含停牌
+              </Tag>
+            );
+          if (r.missing_pct_days > 0)
+            tags.push(
+              <Tag color="orange" key="mp">
+                缺{r.missing_pct_days}天
+              </Tag>
+            );
+          return tags.length ? (
+            <span>{tags}</span>
+          ) : (
+            <span style={{ color: "rgba(255,255,255,0.45)" }}>—</span>
+          );
+        },
+      },
+    ],
+    []
+  );
+
+  const sortedRows = useMemo(() => {
+    if (!result) return [] as DeviationRow[];
+    const arr = [...result.rows];
+    arr.sort((a, b) =>
+      tableSort === "gain"
+        ? b.excess_contrib_pct - a.excess_contrib_pct
+        : a.excess_contrib_pct - b.excess_contrib_pct
+    );
+    return arr;
+  }, [result, tableSort]);
+
   // ---- 渲染 ---------------------------------------------------------------
 
   if (navLoading) {
@@ -599,12 +1214,6 @@ export default function Deviation() {
   );
 
   const summary = result?.summary;
-  const headerTag = summary && (
-    <Tag color={pnlColor(summary.actualExcess) === POS_COLOR ? "green" : pnlColor(summary.actualExcess) === NEG_COLOR ? "red" : "default"}>
-      {tradingDays.length}d · 实际超额{" "}
-      {fmtPct(summary.actualExcess)}
-    </Tag>
-  );
 
   const summaryCardsRow1 = summary && (
     <Row gutter={[12, 12]} style={{ marginBottom: 12 }}>
@@ -717,74 +1326,42 @@ export default function Deviation() {
       </Col>
       <Col xs={12} sm={6}>
         <Card size={isMobile ? "small" : "default"}>
-          <Statistic
-            title={
-              <Tooltip title="超配（含选股 alpha 为正）的股票数 / 累计超额贡献">
-                <span>
-                  正超额贡献 <InfoCircleOutlined style={{ fontSize: 11 }} />
-                </span>
-              </Tooltip>
-            }
-            value={summary.positives}
-            suffix="只"
-            valueStyle={{ color: POS_COLOR }}
-          />
-          <div style={{ marginTop: 4, fontSize: 11, color: POS_COLOR }}>
-            合计 {fmtPct(summary.positiveSum, 2)}
-          </div>
-        </Card>
-      </Col>
-      <Col xs={12} sm={6}>
-        <Card size={isMobile ? "small" : "default"}>
-          <Statistic
-            title={
-              <Tooltip title="持仓中跑输基准的股票（拖累超额）">
-                <span>
-                  负超额贡献 <InfoCircleOutlined style={{ fontSize: 11 }} />
-                </span>
-              </Tooltip>
-            }
-            value={summary.negatives}
-            suffix="只"
-            valueStyle={{ color: NEG_COLOR }}
-          />
-          <div style={{ marginTop: 4, fontSize: 11, color: NEG_COLOR }}>
-            合计 {fmtPct(summary.negativeSum, 2)}
-          </div>
-        </Card>
-      </Col>
-      <Col xs={12} sm={6}>
-        <Card size={isMobile ? "small" : "default"}>
-          <Statistic
-            title="最大正/负贡献"
-            value={
-              summary.topGainer
-                ? summary.topGainer.stock_code
-                : summary.topLoser
-                ? summary.topLoser.stock_code
-                : "—"
-            }
-            valueStyle={{
-              color: summary.topGainer ? POS_COLOR : NEG_COLOR,
-              fontSize: isMobile ? 16 : 18,
+          <Tooltip title="正：跑赢基准的持仓股；负：跑输基准的持仓股。数值为只数与各自累计超额贡献。">
+            <span style={{ fontSize: 14 }}>
+              正/负超额贡献 <InfoCircleOutlined style={{ fontSize: 11 }} />
+            </span>
+          </Tooltip>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "baseline",
+              gap: 12,
+              marginTop: 8,
+              flexWrap: "wrap",
             }}
-          />
+          >
+            <span style={{ color: POS_COLOR, fontWeight: 600 }}>
+              <span style={{ fontSize: isMobile ? 18 : 22 }}>
+                {summary.positives}
+              </span>
+              <span style={{ fontSize: 12, marginLeft: 2 }}>只</span>
+            </span>
+            <span style={{ color: NEUTRAL_COLOR, fontSize: 14 }}>/</span>
+            <span style={{ color: NEG_COLOR, fontWeight: 600 }}>
+              <span style={{ fontSize: isMobile ? 18 : 22 }}>
+                {summary.negatives}
+              </span>
+              <span style={{ fontSize: 12, marginLeft: 2 }}>只</span>
+            </span>
+          </div>
           <div style={{ marginTop: 4, fontSize: 11 }}>
-            {summary.topGainer && (
-              <span style={{ color: POS_COLOR }}>
-                {summary.topGainer.stock_code}{" "}
-                {fmtPct(summary.topGainer.excess_contrib_pct, 2)}
-              </span>
-            )}
-            {summary.topGainer && summary.topLoser && (
-              <span style={{ color: NEUTRAL_COLOR }}> · </span>
-            )}
-            {summary.topLoser && (
-              <span style={{ color: NEG_COLOR }}>
-                {summary.topLoser.stock_code}{" "}
-                {fmtPct(summary.topLoser.excess_contrib_pct, 2)}
-              </span>
-            )}
+            <span style={{ color: POS_COLOR }}>
+              +{fmtPct(summary.positiveSum, 2).replace(/^\+/, "")}
+            </span>
+            <span style={{ color: NEUTRAL_COLOR }}> · </span>
+            <span style={{ color: NEG_COLOR }}>
+              {fmtPct(summary.negativeSum, 2)}
+            </span>
           </div>
         </Card>
       </Col>
@@ -792,55 +1369,6 @@ export default function Deviation() {
   );
 
   const partialErrorList = Array.from(partialErrors.entries());
-
-  // 指数对比图：净值（归一化）
-  const navCompareOption = comparisonData && {
-    tooltip: {
-      trigger: "axis" as const,
-      confine: true,
-      formatter: (params: any) => {
-        if (!Array.isArray(params)) return "";
-        let html = `${params[0].axisValueLabel}<br/>`;
-        for (const p of params) {
-          html += `${p.marker} ${p.seriesName}: <b>${(p.value as number).toFixed(4)}</b><br/>`;
-        }
-        return html;
-      },
-    },
-    legend: { data: ["组合净值", indexLabel] },
-    xAxis: {
-      type: "category" as const,
-      data: comparisonData.dates,
-      axisLabel: isMobile ? { rotate: 45, fontSize: 10 } : {},
-    },
-    yAxis: {
-      type: "value" as const,
-      name: "归一化净值",
-      scale: true,
-      axisLabel: { formatter: (v: number) => v.toFixed(2) },
-    },
-    series: [
-      {
-        name: "组合净值",
-        type: "line",
-        data: comparisonData.portfolioNav,
-        smooth: true,
-        lineStyle: { width: 2 },
-        symbol: "none",
-      },
-      {
-        name: indexLabel,
-        type: "line",
-        data: comparisonData.indexNav,
-        smooth: true,
-        lineStyle: { width: 2 },
-        symbol: "none",
-      },
-    ],
-    grid: isMobile
-      ? { left: 50, right: 50, top: 40, bottom: 30 }
-      : { left: 80, right: 80, top: 40, bottom: 30 },
-  };
 
   // 指数对比图：收益率与超额收益
   const returnsCompareOption = comparisonData && {
@@ -911,10 +1439,9 @@ export default function Deviation() {
         message="偏离归因 · 算法说明"
         description={
           <div style={{ fontSize: 12, lineHeight: 1.7 }}>
-            采用 <b>主动持仓近似法</b>：每只股票超额贡献 = Σ 当日权重 × (个股当日涨跌 − 基准当日涨跌)。
-            假设基准成分股权重 ≈ 0（因后端暂不提供 <code>/api/index_weight</code>），所有持仓股都视为
+            采用 <b>主动持仓近似法</b>：每只股票超额贡献 = Σ 当日权重 × (个股当日涨跌 − 基准当日涨跌)。<p></p>
+            假设基准成分股权重 ≈ 0（因目前暂无法获得基准指数的具体个股权重），所有持仓股都视为
             <b> 超配</b>，未持有的成分股视为 <b>低配</b>（其影响合并到「现金拖累」中）。
-            真实 Brinson 配置/选股拆分需待指数成分股权重接口就绪后升级。
           </div>
         }
       />
@@ -976,7 +1503,6 @@ export default function Deviation() {
               size={isMobile ? "small" : "middle"}
             />
             {rangePicker}
-            {headerTag}
           </Space>
         }
         size={isMobile ? "small" : "default"}
@@ -995,25 +1521,6 @@ export default function Deviation() {
 
       {!tooManyDays && (
         <Card
-          title={`净值对比（区间归一化 · 起始日 = 1.00）`}
-          size={isMobile ? "small" : "default"}
-          style={{ marginTop: 12 }}
-        >
-          {loadingPeriod ? (
-            <Spin style={{ display: "block", margin: "60px auto" }} />
-          ) : navCompareOption ? (
-            <ReactECharts
-              option={navCompareOption}
-              style={{ height: isMobile ? 260 : 360 }}
-            />
-          ) : (
-            <Empty description="区间内组合或基准数据不足，无法绘制对比图" />
-          )}
-        </Card>
-      )}
-
-      {!tooManyDays && (
-        <Card
           title={`收益率对比（区间累计 · 含超额收益曲线）`}
           size={isMobile ? "small" : "default"}
           style={{ marginTop: 12 }}
@@ -1028,6 +1535,163 @@ export default function Deviation() {
           ) : (
             <Empty description="区间内组合或基准数据不足，无法绘制对比图" />
           )}
+        </Card>
+      )}
+
+      {!tooManyDays && (
+        <Card
+          title={
+            <Space wrap size={[12, 8]}>
+              <span>偏离归因图</span>
+              <Segmented
+                value={chartMode}
+                onChange={(v) => setChartMode(v as "stock" | "slot")}
+                options={[
+                  { label: "按股票", value: "stock" },
+                  { label: "按槽位", value: "slot" },
+                ]}
+                size={isMobile ? "small" : "middle"}
+              />
+              <Tooltip title="超额贡献 = Σ 当日权重 × (个股 pct_chg − 基准 pct_chg)。绿/红柱分别为正/负贡献，按 |超额贡献| 降序排列。">
+                <InfoCircleOutlined style={{ color: "rgba(255,255,255,0.65)" }} />
+              </Tooltip>
+            </Space>
+          }
+          size={isMobile ? "small" : "default"}
+          style={{ marginTop: 12 }}
+        >
+          {loadingPeriod ? (
+            <Spin style={{ display: "block", margin: "60px auto" }} />
+          ) : !result ? (
+            <Empty description="选择区间后查看偏离归因" />
+          ) : !attribOptions.gain && !attribOptions.loss ? (
+            <Empty description="区间内无可归因数据" />
+          ) : (
+            <div>
+              <div
+                style={{
+                  fontSize: 12,
+                  color: POS_COLOR,
+                  marginBottom: 4,
+                  fontWeight: 600,
+                }}
+              >
+                正超额贡献{" "}
+                {chartMode === "stock"
+                  ? `（${
+                      result.rows.filter((r) => r.excess_contrib_pct > 0)
+                        .length
+                    } 只）`
+                  : `（${
+                      slotRows.filter((s) => s.excess_contrib_pct > 0).length
+                    } 个槽位）`}
+              </div>
+              {attribOptions.gain ? (
+                <ReactECharts
+                  option={attribOptions.gain}
+                  style={{ height: isMobile ? 260 : 360 }}
+                />
+              ) : (
+                <Empty
+                  image={Empty.PRESENTED_IMAGE_SIMPLE}
+                  description="无正贡献"
+                />
+              )}
+
+              <div
+                style={{
+                  fontSize: 12,
+                  color: NEG_COLOR,
+                  marginTop: 16,
+                  marginBottom: 4,
+                  fontWeight: 600,
+                }}
+              >
+                负超额贡献{" "}
+                {chartMode === "stock"
+                  ? `（${
+                      result.rows.filter((r) => r.excess_contrib_pct < 0)
+                        .length
+                    } 只）`
+                  : `（${
+                      slotRows.filter((s) => s.excess_contrib_pct < 0).length
+                    } 个槽位）`}
+              </div>
+              {attribOptions.loss ? (
+                <ReactECharts
+                  option={attribOptions.loss}
+                  style={{ height: isMobile ? 260 : 360 }}
+                />
+              ) : (
+                <Empty
+                  image={Empty.PRESENTED_IMAGE_SIMPLE}
+                  description="无负贡献"
+                />
+              )}
+            </div>
+          )}
+        </Card>
+      )}
+
+      {!tooManyDays && (
+        <Card
+          title={
+            <Space>
+              <span>每日超额柱状（线性归因）</span>
+              <Tooltip title="每日 Σ 个股权重×(个股 pct_chg − 基准 pct_chg)，正值表示当日组合跑赢基准，反之跑输。所有柱之和 ≈ 卡片中的「归因合计(线性)」（不含现金拖累）。">
+                <InfoCircleOutlined style={{ color: "rgba(255,255,255,0.65)" }} />
+              </Tooltip>
+            </Space>
+          }
+          size={isMobile ? "small" : "default"}
+          style={{ marginTop: 12 }}
+        >
+          {loadingPeriod ? (
+            <Spin style={{ display: "block", margin: "60px auto" }} />
+          ) : dailyExcessOption ? (
+            <ReactECharts
+              option={dailyExcessOption}
+              style={{ height: isMobile ? 220 : 280 }}
+            />
+          ) : (
+            <Empty description="区间内无可归因数据" />
+          )}
+        </Card>
+      )}
+
+      {!tooManyDays && result && result.rows.length > 0 && (
+        <Card
+          title={
+            <Space wrap size={[12, 8]}>
+              <span>偏离归因明细</span>
+              <Segmented
+                value={tableSort}
+                onChange={(v) => setTableSort(v as "gain" | "loss")}
+                options={[
+                  { label: "正贡献优先", value: "gain" },
+                  { label: "负贡献优先", value: "loss" },
+                ]}
+                size={isMobile ? "small" : "middle"}
+              />
+              <Tag>{result.rows.length} 只</Tag>
+            </Space>
+          }
+          size={isMobile ? "small" : "default"}
+          style={{ marginTop: 12 }}
+        >
+          <Table<DeviationRow>
+            dataSource={sortedRows}
+            columns={tableColumns as any}
+            rowKey="stock_code"
+            size={isMobile ? "small" : "middle"}
+            pagination={{
+              pageSize: 20,
+              showSizeChanger: true,
+              pageSizeOptions: [10, 20, 50, 100],
+              size: isMobile ? "small" : "default",
+            }}
+            scroll={{ x: 980 }}
+          />
         </Card>
       )}
     </div>
