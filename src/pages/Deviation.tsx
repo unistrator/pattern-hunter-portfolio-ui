@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Card,
   Spin,
@@ -736,9 +736,6 @@ export default function Deviation() {
                 `<span style="color:#faad14">缺涨跌幅天数: ${r.missing_pct_days}</span>`
               );
             }
-            if (r.has_realtime) {
-              lines.push('<span style="color:#1677ff">含实时数据</span>');
-            }
             return lines.join("<br/>");
           },
         },
@@ -1008,14 +1005,7 @@ export default function Deviation() {
         width: 130,
       },
       {
-        title: () => (
-          <span>
-            槽位{" "}
-            <Tooltip title="按区间末日所属槽位展示。区间内换过槽位的股票仅反映末位状态。">
-              <InfoCircleOutlined style={{ color: "rgba(255,255,255,0.45)" }} />
-            </Tooltip>
-          </span>
-        ),
+        title: "槽位",
         dataIndex: "latest_slot_idx",
         key: "latest_slot_idx",
         width: 110,
@@ -1037,7 +1027,7 @@ export default function Deviation() {
         title: () => (
           <span>
             平均权重{" "}
-            <Tooltip title="区间内 Σ 当日权重 / 活跃天数。当日权重 = shares × close / nav.total_value">
+            <Tooltip title="区间内 Σ 当日权重 / 活跃天数。">
               <InfoCircleOutlined style={{ color: "rgba(255,255,255,0.45)" }} />
             </Tooltip>
           </span>
@@ -1051,7 +1041,7 @@ export default function Deviation() {
         title: () => (
           <span>
             个股贡献{" "}
-            <Tooltip title="Σ 当日权重 × 个股当日 pct_chg（百分点，线性近似）">
+            <Tooltip title="Σ 当日权重 × 个股当日收益率（百分点，线性近似）">
               <InfoCircleOutlined style={{ color: "rgba(255,255,255,0.45)" }} />
             </Tooltip>
           </span>
@@ -1067,7 +1057,7 @@ export default function Deviation() {
         title: () => (
           <span>
             基准贡献{" "}
-            <Tooltip title="Σ 当日权重 × 基准当日 pct_chg（假设这块仓位换成指数）">
+            <Tooltip title="Σ 当日权重 × 基准当日收益率（假设这块仓位换成指数）">
               <InfoCircleOutlined style={{ color: "rgba(255,255,255,0.45)" }} />
             </Tooltip>
           </span>
@@ -1083,7 +1073,7 @@ export default function Deviation() {
         title: () => (
           <span>
             超额贡献{" "}
-            <Tooltip title="Σ 当日权重 × (个股 pct_chg − 基准 pct_chg)，该股对组合 vs 基准超额的累计贡献">
+            <Tooltip title="Σ 当日权重 × (个股收益率 − 基准收益率)">
               <InfoCircleOutlined style={{ color: "rgba(255,255,255,0.45)" }} />
             </Tooltip>
           </span>
@@ -1098,57 +1088,10 @@ export default function Deviation() {
         ),
       },
       {
-        title: () => (
-          <span>
-            区间涨跌{" "}
-            <Tooltip title="个股区间真实复利涨跌：Π(1 + pct_chg/100) − 1">
-              <InfoCircleOutlined style={{ color: "rgba(255,255,255,0.45)" }} />
-            </Tooltip>
-          </span>
-        ),
-        dataIndex: "stock_period_return_pct",
-        key: "stock_period_return_pct",
-        width: 110,
-        render: (v: number | null) => (
-          <span style={{ color: pnlColor(v) }}>{fmtPct(v, 2)}</span>
-        ),
-      },
-      {
         title: "活跃天数",
         dataIndex: "active_days",
         key: "active_days",
         width: 90,
-      },
-      {
-        title: "数据质量",
-        key: "quality",
-        width: 130,
-        render: (_: unknown, r: DeviationRow) => {
-          const tags: ReactNode[] = [];
-          if (r.has_realtime)
-            tags.push(
-              <Tag color="blue" key="rt">
-                实时
-              </Tag>
-            );
-          if (r.has_suspended_day)
-            tags.push(
-              <Tag color="orange" key="sus">
-                含停牌
-              </Tag>
-            );
-          if (r.missing_pct_days > 0)
-            tags.push(
-              <Tag color="orange" key="mp">
-                缺{r.missing_pct_days}天
-              </Tag>
-            );
-          return tags.length ? (
-            <span>{tags}</span>
-          ) : (
-            <span style={{ color: "rgba(255,255,255,0.45)" }}>—</span>
-          );
-        },
       },
     ],
     []
@@ -1257,7 +1200,7 @@ export default function Deviation() {
         <Card size={isMobile ? "small" : "default"}>
           <Statistic
             title={
-              <Tooltip title="实际超额 = 区间组合收益 − 区间基准收益（点对点复合）">
+              <Tooltip title="实际超额 = 区间组合收益 − 区间基准收益">
                 <span>
                   实际超额收益 <InfoCircleOutlined style={{ fontSize: 11 }} />
                 </span>
@@ -1326,11 +1269,7 @@ export default function Deviation() {
       </Col>
       <Col xs={12} sm={6}>
         <Card size={isMobile ? "small" : "default"}>
-          <Tooltip title="正：跑赢基准的持仓股；负：跑输基准的持仓股。数值为只数与各自累计超额贡献。">
-            <span style={{ fontSize: 14 }}>
-              正/负超额贡献 <InfoCircleOutlined style={{ fontSize: 11 }} />
-            </span>
-          </Tooltip>
+          <span style={{ fontSize: 14 }}>正/负超额贡献</span>
           <div
             style={{
               display: "flex",
@@ -1362,6 +1301,33 @@ export default function Deviation() {
             <span style={{ color: NEG_COLOR }}>
               {fmtPct(summary.negativeSum, 2)}
             </span>
+          </div>
+        </Card>
+      </Col>
+      <Col xs={12} sm={6}>
+        <Card size={isMobile ? "small" : "default"}>
+          <Statistic
+            title={
+              <Tooltip title="未持仓现金对超额的影响 = Σ (−现金权重 × 基准当日涨跌)。基准上涨时为拖累（负），基准下跌时为正贡献。">
+                <span>
+                  现金影响 <InfoCircleOutlined style={{ fontSize: 11 }} />
+                </span>
+              </Tooltip>
+            }
+            value={summary.cashContribPct}
+            precision={4}
+            suffix="%"
+            valueStyle={{ color: pnlColor(summary.cashContribPct) }}
+            prefix={
+              summary.cashContribPct >= 0 ? (
+                <ArrowUpOutlined />
+              ) : (
+                <ArrowDownOutlined />
+              )
+            }
+          />
+          <div style={{ marginTop: 4, fontSize: 11, color: NEUTRAL_COLOR }}>
+            平均现金占比 {((1 - summary.avgPosRatio) * 100).toFixed(1)}%
           </div>
         </Card>
       </Col>
@@ -1552,9 +1518,6 @@ export default function Deviation() {
                 ]}
                 size={isMobile ? "small" : "middle"}
               />
-              <Tooltip title="超额贡献 = Σ 当日权重 × (个股 pct_chg − 基准 pct_chg)。绿/红柱分别为正/负贡献，按 |超额贡献| 降序排列。">
-                <InfoCircleOutlined style={{ color: "rgba(255,255,255,0.65)" }} />
-              </Tooltip>
             </Space>
           }
           size={isMobile ? "small" : "default"}
@@ -1635,14 +1598,7 @@ export default function Deviation() {
 
       {!tooManyDays && (
         <Card
-          title={
-            <Space>
-              <span>每日超额柱状（线性归因）</span>
-              <Tooltip title="每日 Σ 个股权重×(个股 pct_chg − 基准 pct_chg)，正值表示当日组合跑赢基准，反之跑输。所有柱之和 ≈ 卡片中的「归因合计(线性)」（不含现金拖累）。">
-                <InfoCircleOutlined style={{ color: "rgba(255,255,255,0.65)" }} />
-              </Tooltip>
-            </Space>
-          }
+          title="每日超额"
           size={isMobile ? "small" : "default"}
           style={{ marginTop: 12 }}
         >
@@ -1668,8 +1624,8 @@ export default function Deviation() {
                 value={tableSort}
                 onChange={(v) => setTableSort(v as "gain" | "loss")}
                 options={[
-                  { label: "正贡献优先", value: "gain" },
-                  { label: "负贡献优先", value: "loss" },
+                  { label: "正贡献", value: "gain" },
+                  { label: "负贡献", value: "loss" },
                 ]}
                 size={isMobile ? "small" : "middle"}
               />
@@ -1685,7 +1641,7 @@ export default function Deviation() {
             rowKey="stock_code"
             size={isMobile ? "small" : "middle"}
             pagination={{
-              pageSize: 20,
+              defaultPageSize: 20,
               showSizeChanger: true,
               pageSizeOptions: [10, 20, 50, 100],
               size: isMobile ? "small" : "default",

@@ -161,25 +161,53 @@ function AppContent() {
 
   return (
     <Layout style={{ minHeight: "100vh" }}>
-      <Sider breakpoint="lg" collapsedWidth={0}>
-        <div style={{ height: 48, margin: 16, display: "flex", alignItems: "center", justifyContent: "center" }}>
-          <span style={{ color: "#fff", fontWeight: 700, fontSize: 16 }}>Pattern Hunter</span>
-        </div>
-        <Menu
-          theme="dark"
-          mode="inline"
-          selectedKeys={[selectedKey === "/" ? "/" : selectedKey]}
-          items={menuItems}
-        />
-        <div style={{ position: "absolute", bottom: 16, width: "100%", textAlign: "center" }}>
-          <Button
-            type="link"
-            size="small"
-            danger
-            onClick={() => { clearToken(); window.location.reload(); }}
+      <Sider
+        breakpoint="lg"
+        collapsedWidth={0}
+        style={{
+          height: "100vh",
+          position: "sticky",
+          top: 0,
+          left: 0,
+          overflow: "auto",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            minHeight: "100%",
+          }}
+        >
+          <div
+            style={{
+              height: 48,
+              margin: 16,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              flexShrink: 0,
+            }}
           >
-            清除 Token
-          </Button>
+            <span style={{ color: "#fff", fontWeight: 700, fontSize: 16 }}>Pattern Hunter</span>
+          </div>
+          <Menu
+            theme="dark"
+            mode="inline"
+            selectedKeys={[selectedKey === "/" ? "/" : selectedKey]}
+            items={menuItems}
+            style={{ flex: 1, borderRight: 0 }}
+          />
+          <div style={{ padding: "16px 0", textAlign: "center", flexShrink: 0 }}>
+            <Button
+              type="link"
+              size="small"
+              danger
+              onClick={() => { clearToken(); window.location.reload(); }}
+            >
+              清除 Token
+            </Button>
+          </div>
         </div>
       </Sider>
       <Layout>

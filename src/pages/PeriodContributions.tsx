@@ -129,6 +129,9 @@ interface PeriodRow {
   has_suspended_day: boolean;
   // 区间内有任意一天数据来自实时
   has_realtime: boolean;
+  // 区间内是否发生过「日内开仓 + 当日清仓」的 round-trip
+  // （昨日无持仓 + 当日 buy 后又全部 sell；走 sell_amount − buy_amount 口径，不依赖昨收）
+  has_intraday_day: boolean;
   // true = 该股票在区间起始日开盘前未持仓（中途新建仓）
   inception_mid_period: boolean;
   // 区间内最后一次出现在 holdings/items 中的日期（用于「已清」展示清仓时点）
@@ -629,6 +632,7 @@ export default function PeriodContributions() {
           missing_pre_close_days: 0,
           has_suspended_day: false,
           has_realtime: false,
+          has_intraday_day: false,
           inception_mid_period: false,
           last_appearance_date: null,
         };
@@ -694,7 +698,11 @@ export default function PeriodContributions() {
           } else {
             const close = it!.close as number;
             const preClose = it!.pre_close as number;
-            holdPnl = sharesPrev * (close - preClose);
+            // 全天持有的份额（昨持 − 当日已卖），用于 hold_pnl 的乘数，
+            // 避免与 sell_pnl 重复计提：已卖出份额的 (close − preClose) 部分
+            // 完全由 sell_pnl = sell_amount − preClose × sell_shares 承担。
+            const sharesHeldThroughDay = sharesPrev - exec.sell_shares;
+            holdPnl = sharesHeldThroughDay * (close - preClose);
             buyPnl = close * exec.buy_shares - exec.buy_amount;
             sellPnl = exec.sell_amount - preClose * exec.sell_shares;
             dailyTotal = holdPnl + buyPnl + sellPnl;
@@ -718,11 +726,34 @@ export default function PeriodContributions() {
             lastSlotByCode.set(code, it!.slot_idx);
           }
         } else {
-          // 当日不在 items 里 → 当日完全卖出（已清仓）
+          // 当日不在 items 里 → 当日完全卖出（已清仓）。三个子情况：
+          //   (A) sharesPrev > 0 & 拿到昨收：昨日有持仓 → 全清，按 preClose 做归因
+          //         buy_pnl  = preClose × buy_shares − buy_amount
+          //         sell_pnl = sell_amount − preClose × sell_shares
+          //   (B) sharesPrev == 0 & buy_shares > 0 & sell_shares > 0：日内 round-trip
+          //         （昨日无持仓，前一交易日 holdings 里查不到 code，preClose 必然为 null）
+          //         真实盈亏 = sell_amount − buy_amount，与昨收无关
+          //         展示价用 vwap 代理：first_pre_close ← avg_buy，last_close ← avg_sell
+          //   (C) sharesPrev > 0 但缺 preClose：无法精确归因，归 0 并 missing_pre_close_days += 1
+          //   (D) sharesPrev < 0：理论不可能（无卖空），防御性归 0
           const prevIt = prevItemByCode.get(code);
           const preClose = prevIt?.close ?? null;
           const sharesPrev = exec.sell_shares - exec.buy_shares;
-          if (preClose != null) {
+          const isIntraday =
+            sharesPrev === 0 && exec.buy_shares > 0 && exec.sell_shares > 0;
+
+          if (isIntraday) {
+            sellPnl = exec.sell_amount - exec.buy_amount;
+            dailyTotal = sellPnl;
+            row.has_intraday_day = true;
+            const avgSell = exec.sell_amount / exec.sell_shares;
+            const avgBuy = exec.buy_amount / exec.buy_shares;
+            row.last_close = avgSell;
+            if (!firstPreCloseSeen.has(code)) {
+              row.first_pre_close = avgBuy;
+              firstPreCloseSeen.add(code);
+            }
+          } else if (sharesPrev > 0 && preClose != null) {
             buyPnl = preClose * exec.buy_shares - exec.buy_amount;
             sellPnl = exec.sell_amount - preClose * exec.sell_shares;
             dailyTotal = buyPnl + sellPnl;
@@ -733,9 +764,11 @@ export default function PeriodContributions() {
               row.first_pre_close = preClose;
               firstPreCloseSeen.add(code);
             }
-          } else {
+          } else if (sharesPrev > 0) {
             row.missing_pre_close_days += 1;
           }
+          // sharesPrev < 0：保持全 0，防御性
+
           if (!startPrevSharesSeen.has(code)) {
             row.shares_start_prev = sharesPrev;
             row.inception_mid_period = !(isFirstDay && sharesPrev > 0);
